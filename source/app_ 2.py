@@ -7,6 +7,7 @@ from torch.utils.data import Dataset, DataLoader
 from torch.nn.parallel import DataParallel
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.cuda.amp import GradScaler, autocast  # Per mixed-precision
+from thop import profile
 import rasterio
 from rasterio.errors import RasterioIOError
 from skimage.metrics import structural_similarity as ssim
@@ -27,7 +28,7 @@ DEVICE = get_device()
 NUM_WORKERS = 8
 BATCH_SIZE = 4
 LEARNING_RATE = 0.001
-NUM_EPOCHS = 100
+NUM_EPOCHS = 10
 INPUT_LENGTH = 6
 PRED_LENGTH = 6
 LAMBDA_DECOUPLE = 0.01
@@ -114,7 +115,7 @@ class RadarDataset(Dataset):
         print(f"3. Finestre totali possibili: {self.total_possible_windows}")
         print(f"4. Finestre valide: {self.valid_windows}")
         print(f"5. Finestre non valide: {self.invalid_windows}")
-        print(" ===================================================== ")
+        print(" ===================================================== \n")
 
     def __len__(self):
         return len(self.valid_indices)
@@ -140,68 +141,58 @@ class SpatiotemporalLSTMCell(nn.Module):
     def __init__(self, input_dim, hidden_dim, filter_size):
         super().__init__()
         self.hidden_dim = hidden_dim
-        
-        # Convoluzioni per i gate combinati (input + stato nascosto)
         padding = filter_size // 2
-        self.conv_x = nn.Conv2d(input_dim, hidden_dim * 7, 
-                               kernel_size=filter_size, padding=padding)
-        self.conv_h = nn.Conv2d(hidden_dim, hidden_dim * 7, 
-                               kernel_size=filter_size, padding=padding)
         
-        # Convoluzioni per memoria spaziale (C) e temporale (M)
-        self.conv_c = nn.Conv2d(hidden_dim, hidden_dim * 3, 
-                               kernel_size=1)
-        self.conv_m = nn.Conv2d(hidden_dim, hidden_dim * 3, 
-                               kernel_size=1)
+        # Convoluzioni per input e hidden state
+        self.conv_x = nn.Conv2d(input_dim, hidden_dim * 7, kernel_size=filter_size, padding=padding)
+        self.conv_h = nn.Conv2d(hidden_dim, hidden_dim * 7, kernel_size=filter_size, padding=padding)
         
-        # Convoluzione 1x1 per fondere C e M nell'output
-        self.conv_1x1 = nn.Conv2d(hidden_dim * 2, hidden_dim, 
-                                 kernel_size=1)
+        # Convoluzioni per le due memorie
+        self.conv_c = nn.Conv2d(hidden_dim, hidden_dim * 3, kernel_size=1)
+        self.conv_m = nn.Conv2d(hidden_dim, hidden_dim * 3, kernel_size=1)
+
+        # Fusione delle memorie C e M
+        self.conv_fusion = nn.Conv2d(hidden_dim * 2, hidden_dim, kernel_size=1)
         
-        # Convoluzione per la decoupling loss
-        self.conv_decouple = nn.Conv2d(hidden_dim, hidden_dim, 
-                                       kernel_size=1)
+        # Convoluzione per il termine della decoupling loss
+        self.conv_decouple = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1)
 
     def forward(self, x, h_prev, c_prev, m_prev, m_upper=None):
-        # Aggiorna memoria temporale con flusso bottom-up
-        if m_upper is not None:
-            m_prev = m_prev + m_upper  # Combinazione con memoria del livello superiore
-
-        # Assicurati che le dimensioni spaziali di x e h_prev siano coerenti
+        # Se x ha dimensioni diverse da h_prev, ridimensionalo con bilinear interpolation
         if x.size(2) != h_prev.size(2) or x.size(3) != h_prev.size(3):
             x = F.interpolate(x, size=(h_prev.size(2), h_prev.size(3)), mode='bilinear', align_corners=False)
 
-        # Calcolo gate combinati
-        combined = self.conv_x(x) + self.conv_h(h_prev)
-        i_c, i_m, f_c, f_m, g_c, g_m, o = torch.split(
-            combined, self.hidden_dim, dim=1)
+        # Flusso zig-zag: sommare M_t con il livello superiore
+        if m_upper is not None:
+            m_prev = m_prev + torch.sigmoid(m_upper)  # Mantenere valori normalizzati
 
-        # Aggiornamento memoria spaziale (C)
+        # Convoluzioni per gate
+        combined = self.conv_x(x) + self.conv_h(h_prev)
+        i_c, i_m, f_c, f_m, g_c, g_m, o = torch.split(combined, self.hidden_dim, dim=1)
+
+        # Memoria temporale C
         c_conv = self.conv_c(c_prev)
         f_c_c, i_c_c, o_c = torch.split(c_conv, self.hidden_dim, dim=1)
         delta_c = torch.sigmoid(i_c + i_c_c) * torch.tanh(g_c)
         c_new = torch.sigmoid(f_c + f_c_c) * c_prev + delta_c
 
-        # Aggiornamento memoria temporale (M)
+        # Memoria spatiotemporale M
         m_conv = self.conv_m(m_prev)
         f_m_m, i_m_m, o_m = torch.split(m_conv, self.hidden_dim, dim=1)
         delta_m = torch.sigmoid(i_m + i_m_m) * torch.tanh(g_m)
         m_new = torch.sigmoid(f_m + f_m_m) * m_prev + delta_m
 
-        # === Modifiche chiave ===
-        # 1. Fusione C e M con convoluzione 1x1
-        combined_states = torch.cat([c_new, m_new], dim=1)
-        fused_states = self.conv_1x1(combined_states)
-        
-        # 2. Calcolo stato nascosto finale
+        # Fusione delle due memorie
+        fused_states = self.conv_fusion(torch.cat([c_new, m_new], dim=1))
         h_new = torch.sigmoid(o) * torch.tanh(fused_states)
-        
-        # 3. Decoupling loss con convoluzione condivisa
+
+        # Decoupling loss corretta
         delta_c_decoupled = self.conv_decouple(delta_c)
         delta_m_decoupled = self.conv_decouple(delta_m)
         decouple_loss = torch.mean(torch.abs(delta_c_decoupled - delta_m_decoupled))
-        
+
         return h_new, c_new, m_new, decouple_loss
+
 
 class PredRNN_Block(nn.Module):
     def __init__(self, num_layers, num_hidden, filter_size):
@@ -288,10 +279,10 @@ class UNet_Encoder(nn.Module):
     def contract_block(self, in_channels, out_channels, kernel_size, padding):
         return nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding),
-            nn.BatchNorm2d(out_channels),
+            nn.BatchNorm2d(out_channels), 
             nn.ReLU(),
             nn.Conv2d(out_channels, out_channels, kernel_size, padding=padding),
-            nn.BatchNorm2d(out_channels),
+            nn.BatchNorm2d(out_channels),  
             nn.ReLU()
         )
 
@@ -306,7 +297,7 @@ class UNet_Decoder(nn.Module):
         super().__init__()
         self.upconv1 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
         self.dec1 = self.expand_block(128, 64, 3, 1)
-        self.upconv2 = nn.ConvTranspose2d(64, out_channels, kernel_size=2, stride=2)
+        self.upconv2 = nn.Conv2d(64, out_channels, kernel_size=1)
 
     def expand_block(self, in_channels, out_channels, kernel_size, padding):
         return nn.Sequential(
@@ -319,15 +310,23 @@ class UNet_Decoder(nn.Module):
         )
 
     def forward(self, x, skip):
-        # Upsampling con ConvTranspose2d
-        x = self.upconv1(x)
-        # Assicurati che le dimensioni spaziali di x corrispondano a quelle di skip
+        # Adattiamo la dimensione spaziale di x prima della concatenazione
         if x.size(2) != skip.size(2) or x.size(3) != skip.size(3):
             x = F.interpolate(x, size=(skip.size(2), skip.size(3)), mode='bilinear', align_corners=False)
-        # Concatenazione
+
+        # Controlliamo che i canali di skip siano 64 (tagliamo se necessario)
+        if skip.size(1) > 64:
+            skip = skip[:, :64, :, :]
+
+        # Controlliamo che i canali di x siano 64
+        if x.size(1) > 64:
+            x = x[:, :64, :, :]
+
+        # Concatenazione corretta (ora ha esattamente 128 canali)
         x = torch.cat([x, skip], dim=1)
-        x = self.dec1(x)
-        x = self.upconv2(x)
+        
+        x = self.dec1(x)            # Ora questa convoluzione riceve esattamente 128 canali
+        x = self.upconv2(x)         # Ultima convoluzione per generare l'output
         return torch.sigmoid(x)
 
 class RainPredRNN(nn.Module):
@@ -356,11 +355,11 @@ class RainPredRNN(nn.Module):
         total_decouple_loss = 0.0
         
         # Inizializza gli stati persistenti
-        h_t = [torch.zeros(batch_size, self.num_hidden, h//2, w//2).to(device) 
+        h_t = [torch.zeros(batch_size, self.num_hidden, h//4, w//4).to(device) 
             for _ in range(self.num_layers)]
-        c_t = [torch.zeros(batch_size, self.num_hidden, h//2, w//2).to(device) 
+        c_t = [torch.zeros(batch_size, self.num_hidden, h//4, w//4).to(device)
             for _ in range(self.num_layers)]
-        m_t = [torch.zeros(batch_size, self.num_hidden, h//2, w//2).to(device) 
+        m_t = [torch.zeros(batch_size, self.num_hidden, h//4, w//4).to(device)
             for _ in range(self.num_layers)]
         
         for t in range(seq_len + pred_length):
@@ -436,34 +435,54 @@ def create_dataloaders(data_path, batch_size=4, num_workers=4):
 
 # === Metriche ===
 def calculate_metrics(preds, targets, threshold_dbz=15):
-    # Converti tensori in numpy
     preds = preds.cpu().numpy().squeeze()
     targets = targets.cpu().numpy().squeeze()
-    
-    # Denormalizza usando il range fisso del paper (0-70 dBZ)
+
+    # Denormalizza i valori (da 0-1 a 0-70 dBZ)
     targets_dbz = targets * 70.0
     preds_dbz = preds * 70.0
-    
-    # Calcola MAE su dBZ
+
+    # Calcola MAE
     mae = np.mean(np.abs(preds_dbz - targets_dbz))
-    
-    # Calcola SSIM con data_range=70 dBZ
-    ssim_val = ssim(
-        preds_dbz, 
-        targets_dbz, 
-        data_range=70.0,
-        win_size=3,
-        multichannel=False
-    )
-    
-    # Binarizza con threshold fisico (es. 15 dBZ)
+
+    # Controlla la dimensione minima per SSIM
+    min_dim = min(preds_dbz.shape[-2], preds_dbz.shape[-1])  # Altezza e larghezza minima
+    win_size = max(3, min(7, min_dim))  # Imposta un minimo di 3x3 per evitare errori
+
+    # SSIM: calcola solo se l'immagine è abbastanza grande
+    if min_dim >= 3:
+        try:
+            ssim_val = ssim(
+                preds_dbz.squeeze(), targets_dbz.squeeze(),
+                data_range=70.0, win_size=win_size, multichannel=False
+            )
+        except ValueError:
+            ssim_val = np.nan  # Se SSIM fallisce comunque, assegna valore nan
+    else:
+        ssim_val = np.nan  # Se troppo piccolo, assegna il valore nan
+
+    # Binarizza con soglia di 15 dBZ
     preds_bin = (preds_dbz > threshold_dbz).astype(np.uint8)
     targets_bin = (targets_dbz > threshold_dbz).astype(np.uint8)
-    
-    # Calcola CSI
-    tn, fp, fn, tp = confusion_matrix(targets_bin.flatten(), preds_bin.flatten()).ravel()
-    csi = tp / (tp + fp + fn + 1e-10)
-    
+
+    # Calcola la matrice di confusione
+    from sklearn.metrics import confusion_matrix
+    cm = confusion_matrix(targets_bin.flatten(), preds_bin.flatten())
+
+    # Gestione dei casi speciali (se cm non è 2x2)
+    if cm.shape == (1, 1):
+        if targets_bin.sum() == 0 and preds_bin.sum() == 0:
+            tn, fp, fn, tp = cm[0, 0], 0, 0, 0
+        else:
+            tn, fp, fn, tp = 0, 0, 0, cm[0, 0]
+    elif cm.shape == (2, 2):
+        tn, fp, fn, tp = cm.ravel()
+    else:
+        tn, fp, fn, tp = 0, 0, 0, 0
+
+    # Calcola il CSI
+    csi = tp / (tp + fp + fn + 1e-10)  # Evita divisione per zero
+
     return {
         'MAE': mae,
         'SSIM': ssim_val,
@@ -511,23 +530,46 @@ def evaluate(model, loader, device):
     
     return metrics
 
+# === Calcolo MACs ===
+def calculate_MACs(model, input_shape=(1, 6, 1, 256, 256)):
+    model.eval()  # Mettiamo il modello in modalità valutazione
+    # Creiamo un input fittizio con la forma corretta
+    dummy_input = torch.randn(input_shape).to(next(model.parameters()).device)
+    # Calcola MACs e numero di parametri
+    macs, params = profile(model, inputs=(dummy_input, 6), verbose=False)
+    return {
+        "MACs (G)": macs / 1e9,  # Convertiamo in miliardi di operazioni
+        "Params (M)": params / 1e6  # Convertiamo in milioni di parametri
+    }
+
 # === Salvataggio predizioni ===
 def save_predictions(predictions, output_dir="outputs"):
     os.makedirs(output_dir, exist_ok=True)
-    preds = predictions.squeeze().cpu().numpy()
+
+    # Assicuriamoci che la forma sia corretta: (batch, timestep, H, W)
+    preds = predictions.detach().cpu().numpy()  # Porta su CPU e converti in NumPy
     
-    for idx, seq in enumerate(preds):
-        for t in range(seq.shape[0]):
-            frame = (seq[t] * 70.0).clip(0, 255).astype(np.uint8)
+    if preds.ndim == 5:  # Se ha forma (batch, timestep, 1, H, W), rimuoviamo il canale 1
+        preds = preds.squeeze(2)  # Rimuove solo la dimensione del canale
+        
+    for batch_idx, seq in enumerate(preds):  # Per ogni sequenza nel batch
+        for t in range(seq.shape[0]):  # Per ogni timestep della sequenza
+            frame = (seq[t] * 70.0).clip(0, 255).astype(np.uint8)  # Converti in 8-bit
             img = Image.fromarray(frame)
-            filename = os.path.join(output_dir, f"pred_{idx:04d}_t{t+1}.tiff")
+
+            # Salviamo l'immagine con un nome chiaro
+            filename = os.path.join(output_dir, f"pred_{batch_idx:04d}_t{t+1}.tiff")
             img.save(filename)
+
 
 # === Inizializzazione modello ===
 torch.cuda.empty_cache()
 model = RainPredRNN(input_dim=1, num_hidden=128, num_layers=2, filter_size=3)
 model.apply(init_weights)
 model = DataParallel(model).to(DEVICE)
+
+# [da vedere perchè] -> macs_info = calculate_MACs(model)
+# -> print(f"MACs: {macs_info['MACs (G)']:.3f} G, Params: {macs_info['Params (M)']:.3f} M")
 
 # === Ottimizzatore e loss ===
 optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
@@ -550,11 +592,12 @@ if __name__ == "__main__":
     # Training
     best_val_loss = float('inf')
     for epoch in range(NUM_EPOCHS):
+        print(f"Epoch {epoch+1}/{NUM_EPOCHS}")
+
         train_loss = train_epoch(model, train_loader, optimizer, criterion, DEVICE)
         val_metrics = evaluate(model, val_loader, DEVICE)
         scheduler.step(val_metrics['MAE'])
-        
-        print(f"Epoch {epoch+1}/{NUM_EPOCHS}")
+            
         print(f"\tTrain Loss: {train_loss:.4f}")
         print(f"\tVal MAE: {val_metrics['MAE']:.4f}, SSIM: {val_metrics['SSIM']:.4f}, CSI: {val_metrics['CSI']:.4f}")
         
@@ -577,3 +620,4 @@ if __name__ == "__main__":
             inputs = inputs.to(DEVICE)
             outputs, _ = model(inputs, PRED_LENGTH)
             save_predictions(outputs, f"/home/f.demicco/RainPredRNN2/test_predictions/batch_{i:04d}")
+        print("predizioni salvate correttamente")

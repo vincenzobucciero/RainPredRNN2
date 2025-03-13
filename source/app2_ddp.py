@@ -7,6 +7,9 @@ from torch.utils.data import Dataset, DataLoader
 from torch.nn.parallel import DataParallel
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.cuda.amp import GradScaler, autocast  # Per mixed-precision
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 import rasterio
 from rasterio.errors import RasterioIOError
 from skimage.metrics import structural_similarity as ssim
@@ -14,6 +17,29 @@ from sklearn.metrics import confusion_matrix
 from PIL import Image
 import torchvision.transforms as transforms
 import glob
+
+# === Funzioni per il setup distribuito ===
+def setup_distributed():
+    if dist.is_initialized():  # Controlla se il gruppo è già inizializzato
+        dist.destroy_process_group()
+        
+    dist_url = "env://"
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend='nccl', init_method=dist_url, 
+                            world_size=world_size, rank=rank)
+    return local_rank
+
+def cleanup_distributed():
+    dist.destroy_process_group()
+
+def get_ddp_model(model, local_rank):
+    model = model.to(local_rank)
+    ddp_model = DDP(model, device_ids=[local_rank])
+    return ddp_model
 
 # === Configurazione multi-GPU ===
 def get_device():
@@ -23,9 +49,10 @@ def get_device():
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # === Configurazione base ===
-DEVICE = get_device()
-NUM_WORKERS = 8
-BATCH_SIZE = 4
+local_rank = setup_distributed()
+DEVICE = torch.device(f"cuda:{local_rank}")
+NUM_WORKERS = 4
+BATCH_SIZE = 2
 LEARNING_RATE = 0.001
 NUM_EPOCHS = 100
 INPUT_LENGTH = 6
@@ -70,7 +97,7 @@ class RadarDataset(Dataset):
         self.files = sorted(glob.glob(os.path.join(data_path, '**/*.tiff'), recursive=True))
         self.is_train = is_train
         self.transform = transforms.Compose([
-            transforms.Resize((256, 256)),
+            transforms.Resize((128, 128)),
             transforms.ToTensor(),
         ])
         # Cache per tenere traccia della validità dei file
@@ -92,7 +119,7 @@ class RadarDataset(Dataset):
                             valid = src.count > 0
                     except RasterioIOError:
                         valid = False
-                        print(f"File non valido: {file}")
+                        print(f"File non valido: {file}", flush=True)
                     self.file_validity[file] = valid
                 
                 if not self.file_validity[file]:
@@ -108,13 +135,13 @@ class RadarDataset(Dataset):
         self.valid_windows = len(self.valid_indices)
         self.invalid_windows = self.total_possible_windows - self.valid_windows
         
-        print(f"\nStatistiche Dataset:")
-        print(f"1. File totali: {self.total_files}")
-        print(f"2. File non validi: {self.invalid_files}")
-        print(f"3. Finestre totali possibili: {self.total_possible_windows}")
-        print(f"4. Finestre valide: {self.valid_windows}")
-        print(f"5. Finestre non valide: {self.invalid_windows}")
-        print(" ===================================================== ")
+        print(f"\nStatistiche Dataset:", flush=True)
+        print(f"1. File totali: {self.total_files}", flush=True)
+        print(f"2. File non validi: {self.invalid_files}", flush=True)
+        print(f"3. Finestre totali possibili: {self.total_possible_windows}", flush=True)
+        print(f"4. Finestre valide: {self.valid_windows}", flush=True)
+        print(f"5. Finestre non valide: {self.invalid_windows}", flush=True)
+        print(" ===================================================== ", flush=True)
 
     def __len__(self):
         return len(self.valid_indices)
@@ -281,17 +308,17 @@ class PredRNN_Block(nn.Module):
 class UNet_Encoder(nn.Module):
     def __init__(self, in_channels):
         super().__init__()
-        self.enc1 = self.contract_block(in_channels, 64, 3, 1)
-        self.enc2 = self.contract_block(64, 128, 3, 1)
+        self.enc1 = self.contract_block(in_channels, 32, 3, 1)
+        self.enc2 = self.contract_block(32, 64, 3, 1)
         self.pool = nn.MaxPool2d(2)
 
     def contract_block(self, in_channels, out_channels, kernel_size, padding):
         return nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding),
-            nn.BatchNorm2d(out_channels),
+            nn.InstanceNorm2d(out_channels),
             nn.ReLU(),
             nn.Conv2d(out_channels, out_channels, kernel_size, padding=padding),
-            nn.BatchNorm2d(out_channels),
+            nn.InstanceNorm2d(out_channels),
             nn.ReLU()
         )
 
@@ -304,27 +331,33 @@ class UNet_Encoder(nn.Module):
 class UNet_Decoder(nn.Module):
     def __init__(self, out_channels):
         super().__init__()
-        self.upconv1 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
-        self.dec1 = self.expand_block(128, 64, 3, 1)
-        self.upconv2 = nn.ConvTranspose2d(64, out_channels, kernel_size=2, stride=2)
+        self.upconv1 = nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2)
+        self.dec1 = self.expand_block(64, 32, 3, 1)
+        self.upconv2 = nn.ConvTranspose2d(32, out_channels, kernel_size=2, stride=2)
+        
+        # Aggiungiamo un layer di convoluzione per allineare i canali
+        self.skip_conv = nn.Conv2d(32, 32, kernel_size=1)
 
     def expand_block(self, in_channels, out_channels, kernel_size, padding):
         return nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding),
-            nn.BatchNorm2d(out_channels),
+            nn.InstanceNorm2d(out_channels),
             nn.ReLU(),
             nn.Conv2d(out_channels, out_channels, kernel_size, padding=padding),
-            nn.BatchNorm2d(out_channels),
+            nn.InstanceNorm2d(out_channels),
             nn.ReLU()
         )
 
     def forward(self, x, skip):
-        # Upsampling con ConvTranspose2d
+        # Prima di concatenare, allineiamo i canali della skip connection
+        skip = self.skip_conv(skip)
+        
         x = self.upconv1(x)
-        # Assicurati che le dimensioni spaziali di x corrispondano a quelle di skip
-        if x.size(2) != skip.size(2) or x.size(3) != skip.size(3):
-            x = F.interpolate(x, size=(skip.size(2), skip.size(3)), mode='bilinear', align_corners=False)
-        # Concatenazione
+        
+        # Se le dimensioni non corrispondono, usiamo l'interpolazione
+        if x.size()[2:] != skip.size()[2:]:
+            x = F.interpolate(x, size=skip.size()[2:], mode='bilinear', align_corners=True)
+        
         x = torch.cat([x, skip], dim=1)
         x = self.dec1(x)
         x = self.upconv2(x)
@@ -525,8 +558,8 @@ def save_predictions(predictions, output_dir="outputs"):
 
 # === Inizializzazione modello ===
 torch.cuda.empty_cache()
-model = RainPredRNN(input_dim=1, num_hidden=128, num_layers=2, filter_size=3)
-model.apply(init_weights)
+model = RainPredRNN(input_dim=1, num_hidden=64, num_layers=2, filter_size=3)
+# model.apply(init_weights)
 model = DataParallel(model).to(DEVICE)
 
 # === Ottimizzatore e loss ===
@@ -537,43 +570,92 @@ criterion = nn.MSELoss()
 # === Supporto mixed-precision ===
 scaler = GradScaler() # Per l'addestramento a precisione mista
 
-# === Main ===
+# === Modifica del main ===
 if __name__ == "__main__":
+    # Setup distribuito
+    local_rank = setup_distributed()
+    DEVICE = torch.device(f"cuda:{local_rank}")
+    
     # Configurazione percorsi
     DATA_PATH = "/home/f.demicco/RainPredRNN2/dataset"
     CHECKPOINT_DIR = "/home/f.demicco/RainPredRNN2/checkpoints"
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    
-    # Creazione dataloaders
-    train_loader, val_loader, test_loader = create_dataloaders(DATA_PATH, BATCH_SIZE, NUM_WORKERS)
-    
+
+    # Creazione dataloaders con DistributedSampler
+    train_dataset = RadarDataset(os.path.join(DATA_PATH, 'train'), is_train=True)
+    val_dataset = RadarDataset(os.path.join(DATA_PATH, 'val'), is_train=False)
+    test_dataset = RadarDataset(os.path.join(DATA_PATH, 'test'), is_train=False)
+
+    train_sampler = DistributedSampler(train_dataset, num_replicas=dist.get_world_size(), rank=local_rank)
+    val_sampler = DistributedSampler(val_dataset, num_replicas=dist.get_world_size(), rank=local_rank)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,  # Non shuffle qui quando si usa DistributedSampler
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+        sampler=train_sampler,
+        drop_last=True
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+        sampler=val_sampler
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=NUM_WORKERS
+    )
+
+    # Inizializzazione modello con DDP
+    model = RainPredRNN(input_dim=1, num_hidden=64, num_layers=2, filter_size=3)
+    model = get_ddp_model(model, local_rank)
+
+    # Ottimizzatore e loss
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+    criterion = nn.MSELoss()
+
+    # Supporto mixed-precision
+    scaler = GradScaler()
+
     # Training
     best_val_loss = float('inf')
     for epoch in range(NUM_EPOCHS):
+        train_sampler.set_epoch(epoch)  # Richiesto per DistributedSampler
         train_loss = train_epoch(model, train_loader, optimizer, criterion, DEVICE)
+        
         val_metrics = evaluate(model, val_loader, DEVICE)
         scheduler.step(val_metrics['MAE'])
-        
-        print(f"Epoch {epoch+1}/{NUM_EPOCHS}")
-        print(f"\tTrain Loss: {train_loss:.4f}")
-        print(f"\tVal MAE: {val_metrics['MAE']:.4f}, SSIM: {val_metrics['SSIM']:.4f}, CSI: {val_metrics['CSI']:.4f}")
-        
-        if val_metrics['MAE'] < best_val_loss:
-            best_val_loss = val_metrics['MAE']
-            torch.save(model.state_dict(), os.path.join(CHECKPOINT_DIR, "best_model.pth"))
-    
+
+        if local_rank == 0:  # Solo il processo principale stampa e salva
+            print(f"Epoch {epoch+1}/{NUM_EPOCHS}", flush=True)
+            print(f"\tTrain Loss: {train_loss:.4f}", flush=True)
+            print(f"\tVal MAE: {val_metrics['MAE']:.4f}, SSIM: {val_metrics['SSIM']:.4f}, CSI: {val_metrics['CSI']:.4f}", flush=True)
+
+            if val_metrics['MAE'] < best_val_loss:
+                best_val_loss = val_metrics['MAE']
+                torch.save(model.state_dict(), os.path.join(CHECKPOINT_DIR, "best_model.pth"))
+
     # Test finale
-    model.load_state_dict(torch.load(os.path.join(CHECKPOINT_DIR, "best_model.pth")))
-    test_metrics = evaluate(model, test_loader, DEVICE)
-    print("Test Results:")
-    print(f"\tMAE: {test_metrics['MAE']:.4f}")
-    print(f"\tSSIM: {test_metrics['SSIM']:.4f}")
-    print(f"\tCSI: {test_metrics['CSI']:.4f}")
-    
-    # Salvataggio predizioni test
-    os.makedirs("/home/f.demicco/RainPredRNN2/test_predictions", exist_ok=True)
-    with torch.no_grad():
-        for i, (inputs, targets) in enumerate(test_loader):
-            inputs = inputs.to(DEVICE)
-            outputs, _ = model(inputs, PRED_LENGTH)
-            save_predictions(outputs, f"/home/f.demicco/RainPredRNN2/test_predictions/batch_{i:04d}")
+    if local_rank == 0:  # Solo il processo principale esegue il test
+        model.load_state_dict(torch.load(os.path.join(CHECKPOINT_DIR, "best_model.pth")))
+        test_metrics = evaluate(model, test_loader, DEVICE)
+        print("Test Results:", flush=True)
+        print(f"\tMAE: {test_metrics['MAE']:.4f}", flush=True)
+        print(f"\tSSIM: {test_metrics['SSIM']:.4f}", flush=True)
+        print(f"\tCSI: {test_metrics['CSI']:.4f}", flush=True)
+
+        # Salvataggio predizioni test
+        os.makedirs("/home/f.demicco/RainPredRNN2/test_predictions", exist_ok=True)
+        with torch.no_grad():
+            for i, (inputs, targets) in enumerate(test_loader):
+                inputs = inputs.to(DEVICE)
+                outputs, _ = model(inputs, PRED_LENGTH)
+                save_predictions(outputs, f"/home/f.demicco/RainPredRNN2/test_predictions/batch_{i:04d}")

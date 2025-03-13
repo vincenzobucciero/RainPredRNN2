@@ -24,7 +24,7 @@ def get_device():
 
 # === Configurazione base ===
 DEVICE = get_device()
-NUM_WORKERS = 8
+NUM_WORKERS = 4
 BATCH_SIZE = 4
 LEARNING_RATE = 0.001
 NUM_EPOCHS = 100
@@ -281,17 +281,17 @@ class PredRNN_Block(nn.Module):
 class UNet_Encoder(nn.Module):
     def __init__(self, in_channels):
         super().__init__()
-        self.enc1 = self.contract_block(in_channels, 64, 3, 1)
-        self.enc2 = self.contract_block(64, 128, 3, 1)
+        self.enc1 = self.contract_block(in_channels, 32, 3, 1)
+        self.enc2 = self.contract_block(32, 64, 3, 1)
         self.pool = nn.MaxPool2d(2)
 
     def contract_block(self, in_channels, out_channels, kernel_size, padding):
         return nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding),
-            nn.BatchNorm2d(out_channels),
+            nn.InstanceNorm2d(out_channels),
             nn.ReLU(),
             nn.Conv2d(out_channels, out_channels, kernel_size, padding=padding),
-            nn.BatchNorm2d(out_channels),
+            nn.InstanceNorm2d(out_channels),
             nn.ReLU()
         )
 
@@ -304,27 +304,33 @@ class UNet_Encoder(nn.Module):
 class UNet_Decoder(nn.Module):
     def __init__(self, out_channels):
         super().__init__()
-        self.upconv1 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
-        self.dec1 = self.expand_block(128, 64, 3, 1)
-        self.upconv2 = nn.ConvTranspose2d(64, out_channels, kernel_size=2, stride=2)
+        self.upconv1 = nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2)
+        self.dec1 = self.expand_block(64, 32, 3, 1)
+        self.upconv2 = nn.ConvTranspose2d(32, out_channels, kernel_size=2, stride=2)
+        
+        # Aggiungiamo un layer di convoluzione per allineare i canali
+        self.skip_conv = nn.Conv2d(32, 32, kernel_size=1)
 
     def expand_block(self, in_channels, out_channels, kernel_size, padding):
         return nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding),
-            nn.BatchNorm2d(out_channels),
+            nn.InstanceNorm2d(out_channels),
             nn.ReLU(),
             nn.Conv2d(out_channels, out_channels, kernel_size, padding=padding),
-            nn.BatchNorm2d(out_channels),
+            nn.InstanceNorm2d(out_channels),
             nn.ReLU()
         )
 
     def forward(self, x, skip):
-        # Upsampling con ConvTranspose2d
+        # Prima di concatenare, allineiamo i canali della skip connection
+        skip = self.skip_conv(skip)
+        
         x = self.upconv1(x)
-        # Assicurati che le dimensioni spaziali di x corrispondano a quelle di skip
-        if x.size(2) != skip.size(2) or x.size(3) != skip.size(3):
-            x = F.interpolate(x, size=(skip.size(2), skip.size(3)), mode='bilinear', align_corners=False)
-        # Concatenazione
+        
+        # Se le dimensioni non corrispondono, usiamo l'interpolazione
+        if x.size()[2:] != skip.size()[2:]:
+            x = F.interpolate(x, size=skip.size()[2:], mode='bilinear', align_corners=True)
+        
         x = torch.cat([x, skip], dim=1)
         x = self.dec1(x)
         x = self.upconv2(x)
@@ -525,8 +531,8 @@ def save_predictions(predictions, output_dir="outputs"):
 
 # === Inizializzazione modello ===
 torch.cuda.empty_cache()
-model = RainPredRNN(input_dim=1, num_hidden=128, num_layers=2, filter_size=3)
-model.apply(init_weights)
+model = RainPredRNN(input_dim=1, num_hidden=64, num_layers=2, filter_size=3)
+# model.apply(init_weights)
 model = DataParallel(model).to(DEVICE)
 
 # === Ottimizzatore e loss ===
