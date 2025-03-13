@@ -487,6 +487,7 @@ def calculate_metrics(preds, targets, threshold_dbz=15):
         'SSIM': ssim_val,
         'CSI': csi
     }
+
 # === Training loop ===
 def train_epoch(model, loader, optimizer, criterion, device):
     model.train()
@@ -528,17 +529,57 @@ def evaluate(model, loader, device):
     
     return metrics
 
+def load_images(image_paths):
+
+    transform = transforms.Compose([
+        transforms.Resize((256, 256)),  # Assicura che tutte le immagini abbiano la stessa dimensione
+        transforms.ToTensor(),  # Converti in tensore
+    ])
+
+    images = []
+    for path in image_paths:
+        img = Image.open(path).convert("L")  # Converti in scala di grigi
+        img = transform(img)  # Applica le trasformazioni
+        img = img.unsqueeze(0)  # Aggiungi una dimensione per il canale (1, H, W)
+        images.append(img)
+
+    images = torch.stack(images, dim=0)  # Combina le immagini in un batch (6, 1, H, W)
+    images = images.unsqueeze(0)  # Aggiungi dimensione batch: (1, 6, 1, H, W)
+
+    return images.to(DEVICE)  # Sposta su GPU se disponibile
+
 # === Salvataggio predizioni ===
 def save_predictions(predictions, output_dir="outputs"):
     os.makedirs(output_dir, exist_ok=True)
-    preds = predictions.squeeze().cpu().numpy()
+
+    # Assicuriamoci che la forma sia corretta: (batch, timestep, H, W)
+    preds = predictions.detach().cpu().numpy()  # Porta su CPU e converti in NumPy
     
-    for idx, seq in enumerate(preds):
-        for t in range(seq.shape[0]):
-            frame = (seq[t] * 70.0).clip(0, 255).astype(np.uint8)
+    if preds.ndim == 5:  # Se ha forma (batch, timestep, 1, H, W), rimuoviamo il canale 1
+        preds = preds.squeeze(2)  # Rimuove solo la dimensione del canale
+        
+    for batch_idx, seq in enumerate(preds):  # Per ogni sequenza nel batch
+        for t in range(seq.shape[0]):  # Per ogni timestep della sequenza
+            frame = (seq[t] * 70.0).clip(0, 255).astype(np.uint8)  # Converti in 8-bit
             img = Image.fromarray(frame)
-            filename = os.path.join(output_dir, f"pred_{idx:04d}_t{t+1}.tiff")
+
+            # Salviamo l'immagine con un nome chiaro
+            filename = os.path.join(output_dir, f"pred_{batch_idx:04d}_t{t+1}.tiff")
             img.save(filename)
+
+def save_predictions_single_test(predictions, output_dir="outputs/custom_test"):
+    os.makedirs(output_dir, exist_ok=True)
+    preds = predictions.detach().cpu().numpy()
+
+    if preds.ndim == 5:  # Se ha forma (batch, timestep, 1, H, W), rimuoviamo il canale 1
+        preds = preds.squeeze(2)
+
+    for t in range(preds.shape[1]):  # Per ogni timestep della sequenza predetta
+        frame = (preds[0, t] * 70.0).clip(0, 255).astype(np.uint8)  # Converti in 8-bit
+        img = Image.fromarray(frame)
+        filename = os.path.join(output_dir, f"pred_t{t+1}.tiff")
+        img.save(filename)
+
 
 # === Inizializzazione modello ===
 torch.cuda.empty_cache()
@@ -587,7 +628,7 @@ if __name__ == "__main__":
     print(f"\tMAE: {test_metrics['MAE']:.4f}")
     print(f"\tSSIM: {test_metrics['SSIM']:.4f}")
     print(f"\tCSI: {test_metrics['CSI']:.4f}")
-    
+
     # Salvataggio predizioni test
     os.makedirs("/home/f.demicco/RainPredRNN2/test_predictions", exist_ok=True)
     with torch.no_grad():
@@ -596,3 +637,23 @@ if __name__ == "__main__":
             outputs, _ = model(inputs, PRED_LENGTH)
             save_predictions(outputs, f"/home/f.demicco/RainPredRNN2/test_predictions/batch_{i:04d}")
         print("predizioni salvate correttamente")
+
+    # ============================================ -> test con 6 immagini
+
+    # image_paths = [
+    #     "image1.tiff", "image2.tiff", "image3.tiff",
+    #     "image4.tiff", "image5.tiff", "image6.tiff"
+    # ]
+
+    # # Carica e pre-processa le immagini
+    # input_images = load_images(image_paths)
+
+    # Inizializza il modello e carica i pesi
+    # model = RainPredRNN(input_dim=1, num_hidden=128, num_layers=2, filter_size=3)
+    # model.load_state_dict(torch.load("checkpoints/best_model.pth", map_location=DEVICE))
+    # model = model.to(DEVICE)
+    # model.eval()  # Modalità di valutazione
+
+    # with torch.no_grad():
+    #     predictions, _ = model(input_images, PRED_LENGTH, teacher_forcing=False)
+    #     save_predictions_single_test(predictions, f"/home/f.demicco/RainPredRNN2/test_predictions/single")
