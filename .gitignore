@@ -174,5 +174,5 @@ cython_debug/
 .pypirc
 
 
-show_tiff/
+show_tiffs/
 recupero_tiffs/
