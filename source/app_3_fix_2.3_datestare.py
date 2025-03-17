@@ -328,17 +328,16 @@ class PredRNN_Block(nn.Module):
 
         for t in range(seq_len):
             ##########################
-            # Fase 1: Propagazione bottom-up (da layer alto a basso)
+            # Fase 1: Propagazione verticale (da layer basso ad alto)
             ##########################
-            for l in reversed(range(self.num_layers)):
-                # Input per il layer corrente
+            for l in range(self.num_layers):
                 if l == 0:
                     input_current = input_sequence[:, t]  # Input diretto per il primo layer
                 else:
                     input_current = h_t[l-1]  # Output del layer precedente
                 
-                # Memoria del layer superiore (se esiste)
-                m_upper = m_t[l+1] if l < self.num_layers - 1 else None
+                # Memoria del layer inferiore (se esiste)
+                m_lower = m_t[l-1] if l > 0 else None
                 
                 # Aggiorna gli stati del layer
                 h_new, c_new, m_new, cell_loss = self.cells[l](
@@ -346,7 +345,7 @@ class PredRNN_Block(nn.Module):
                     h_t[l],
                     c_t[l],
                     m_t[l],
-                    m_upper
+                    m_lower
                 )
                 
                 # Aggiorna gli stati persistenti
@@ -356,13 +355,13 @@ class PredRNN_Block(nn.Module):
                 total_decouple_loss += cell_loss  # Accumula la loss
 
             ##########################
-            # Fase 2: Propagazione top-down (da layer basso ad alto)
+            # Fase 2: Propagazione orizzontale (al prossimo timestamp)
             ##########################
-            for l in range(1, self.num_layers):
-                input_current = h_t[l-1]  # Output del layer precedente
-
-                # Memoria del layer inferirore (se esiste)
-                m_upper = m_t[l-1] if l < self.num_layers - 1 else None
+            for l in reversed(range(self.num_layers)):
+                input_current = h_t[l]  # Mantieni lo stesso input
+                
+                # Memoria del layer superiore (se esiste)
+                m_upper = m_t[l+1] if l < self.num_layers - 1 else None
                 
                 # Aggiorna gli stati del layer
                 h_new, c_new, m_new, cell_loss = self.cells[l](
