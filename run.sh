@@ -6,7 +6,7 @@
 #SBATCH --nodes=1
 #SBATCH --tasks-per-node=1
 #SBATCH --cpus-per-task=32
-#SBATCH --gres=gpu:tesla:4
+#SBATCH --gres=gpu:tesla:1
 
 # Load the CUDA module
 module load cuda/11.3

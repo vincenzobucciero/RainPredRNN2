@@ -72,7 +72,7 @@ class RadarDataset(Dataset):
         self.is_train = is_train
         self.transform = transforms.Compose([
             # transforms.Resize((600, 700)),
-            transforms.CenterCrop((350, 500)),
+            transforms.CenterCrop((256, 256)),
             transforms.ToTensor(),
         ])
         # Cache per tenere traccia della validità dei file
@@ -139,75 +139,220 @@ class RadarDataset(Dataset):
 
 # === Modello ===
 class SpatiotemporalLSTMCell(nn.Module):
-    def __init__(self, input_dim, hidden_dim, filter_size):
+    def __init__(self, input_dim, hidden_dim, width, filter_size=3):
         super().__init__()
         self.hidden_dim = hidden_dim
         padding = filter_size // 2
         
-        # Convoluzioni per input e hidden state
-        self.conv_x = nn.Conv2d(input_dim, hidden_dim * 7, kernel_size=filter_size, padding=padding)
-        self.conv_h = nn.Conv2d(hidden_dim, hidden_dim * 7, kernel_size=filter_size, padding=padding)
+        # Convoluzioni con LayerNorm
+        self.conv_x = nn.Sequential(
+            nn.Conv2d(input_dim, hidden_dim * 7, kernel_size=filter_size, padding=padding),
+            nn.LayerNorm([hidden_dim * 7, width, width])
+        )
+        self.conv_h = nn.Sequential(
+            nn.Conv2d(hidden_dim, hidden_dim * 4, kernel_size=filter_size, padding=padding),
+            nn.LayerNorm([hidden_dim * 4, width, width])
+        )
+        self.conv_m = nn.Sequential(
+            nn.Conv2d(hidden_dim, hidden_dim * 3, kernel_size=1),
+            nn.LayerNorm([hidden_dim * 3, width, width])
+        )
         
-        # Convoluzioni per le due memorie
-        self.conv_c = nn.Conv2d(hidden_dim, hidden_dim * 3, kernel_size=1)
-        self.conv_m = nn.Conv2d(hidden_dim, hidden_dim * 3, kernel_size=1)
+        # Convoluzione per la memoria temporale C
+        self.conv_c = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1)
 
-        # Fusione delle memorie C e M
-        self.conv_fusion = nn.Conv2d(hidden_dim * 2, hidden_dim, kernel_size=1)
-        
-        # **Due convoluzioni separate per il decoupling**
-        self.conv_decouple_c = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1)
-        self.conv_decouple_m = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1)
+        # Convoluzione finale per combinare C e M
+        self.conv_last = nn.Conv2d(hidden_dim * 2, hidden_dim, kernel_size=1)
+
+        # Convoluzione per la loss di decoupling
+        self.conv_decouple = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1)
 
     def forward(self, x, h_prev, c_prev, m_prev, m_upper=None):
-        # Se x ha dimensioni diverse da h_prev, ridimensionalo con bilinear interpolation
+        # Se le dimensioni non corrispondono, ridimensiona con interpolazione bilineare
         if x.size(2) != h_prev.size(2) or x.size(3) != h_prev.size(3):
             x = F.interpolate(x, size=(h_prev.size(2), h_prev.size(3)), mode='bilinear', align_corners=False)
 
         # Flusso zig-zag: sommare M_t con il livello superiore
         if m_upper is not None:
-            m_prev = m_prev + torch.sigmoid(m_upper)  # Mantenere valori normalizzati
+            m_prev = m_prev + torch.sigmoid(m_upper)  # Manteniamo i valori normalizzati
 
-        # Convoluzioni per gate
-        combined = self.conv_x(x) + self.conv_h(h_prev)
-        i_c, i_m, f_c, f_m, g_c, g_m, o = torch.split(combined, self.hidden_dim, dim=1)
+        # Convoluzioni per ottenere i gate
+        x_concat = self.conv_x(x)
+        h_concat = self.conv_h(h_prev)
+        m_concat = self.conv_m(m_prev)
+        c_conv = self.conv_c(c_prev)  # Convoluzione di C_{t-1} per i_t e f_t
 
-        # Memoria temporale C
-        c_conv = self.conv_c(c_prev)
-        f_c_c, i_c_c, o_c = torch.split(c_conv, self.hidden_dim, dim=1)
-        delta_c = torch.sigmoid(i_c + i_c_c) * torch.tanh(g_c)
-        c_new = torch.sigmoid(f_c + f_c_c) * c_prev + delta_c
+        # Splitting dei gate
+        i_x, f_x, g_x, i_x_prime, f_x_prime, g_x_prime, o_x = torch.split(x_concat, self.hidden_dim, dim=1)
+        i_h, f_h, g_h, o_h = torch.split(h_concat, self.hidden_dim, dim=1)
+        i_m, f_m, g_m = torch.split(m_concat, self.hidden_dim, dim=1)
 
-        # Memoria spatiotemporale M
-        m_conv = self.conv_m(m_prev)
-        f_m_m, i_m_m, o_m = torch.split(m_conv, self.hidden_dim, dim=1)
-        delta_m = torch.sigmoid(i_m + i_m_m) * torch.tanh(g_m)
-        m_new = torch.sigmoid(f_m + f_m_m) * m_prev + delta_m
+        # **Aggiornamento memoria temporale C**
+        i_t = torch.sigmoid(i_x + i_h + c_conv)  # Aggiunto termine C_{t-1}
+        f_t = torch.sigmoid(f_x + f_h + c_conv)  # Aggiunto termine C_{t-1}
+        g_t = torch.tanh(g_x + g_h)
 
-        # Fusione delle due memorie
-        fused_states = self.conv_fusion(torch.cat([c_new, m_new], dim=1))
-        h_new = torch.sigmoid(o) * torch.tanh(fused_states)
+        delta_c = i_t * g_t
+        c_new = f_t * c_prev + delta_c
 
-        # **Calcolo della decoupling loss con convoluzioni separate**
-        delta_c_decoupled = self.conv_decouple_c(delta_c)  # W_decouple * (i_t ⊙ g_t)
-        delta_m_decoupled = self.conv_decouple_m(delta_m)  # W_decouple * (i'_t ⊙ g'_t)
+        # **Aggiornamento memoria spatiotemporale M**
+        i_t_prime = torch.sigmoid(i_x_prime + i_m)
+        f_t_prime = torch.sigmoid(f_x_prime + f_m)
+        g_t_prime = torch.tanh(g_x_prime + g_m)
 
-        # **Similarità coseno direttamente con F.cosine_similarity**
-        cosine_similarity = F.cosine_similarity(delta_c_decoupled, delta_m_decoupled, dim=1)
+        delta_m = i_t_prime * g_t_prime
+        m_new = f_t_prime * m_prev + delta_m
 
-        # **Perdita di decoupling (minimizzare la similarità)**
+        # **Combinazione C e M per l'output**
+        mem = torch.cat([c_new, m_new], dim=1)
+        o_t = torch.sigmoid(o_x + o_h + c_new)  # Aggiunto termine C_t
+        h_new = o_t * torch.tanh(self.conv_last(mem))
+
+        # **Decoupling loss (con convoluzione extra)**
+        delta_c_mod = self.conv_decouple(delta_c)
+        delta_m_mod = self.conv_decouple(delta_m)
+        cosine_similarity = F.cosine_similarity(delta_c_mod, delta_m_mod, dim=1)
         decouple_loss = torch.mean(1 - cosine_similarity)  # Minimizza la similarità tra C e M
 
         return h_new, c_new, m_new, decouple_loss
 
+class UNet_Encoder(nn.Module):
+    def __init__(self, input_channels):
+        super().__init__()
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(input_channels, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True)
+        )
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True)
+        )
+        self.pool1 = nn.MaxPool2d(2, 2)
+        
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True)
+        )
+        self.conv4 = nn.Sequential(
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.conv2(x)
+        skip1 = x
+        x = self.pool1(x)
+        
+        x = self.conv3(x)
+        x = self.conv4(x)
+        skip2 = x
+        
+        return x, skip1, skip2
+
+class UNet_Decoder(nn.Module):
+    def __init__(self, output_channels):
+        super().__init__()
+        self.conv5 = nn.Sequential(
+            nn.Conv2d(256, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True)
+        )
+        self.conv6 = nn.Sequential(
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.up1 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
+        self.conv7 = nn.Sequential(
+            nn.Conv2d(128, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True)
+        )
+        self.conv8 = nn.Sequential(
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True)
+        )
+        self.final_conv = nn.Conv2d(64, output_channels, kernel_size=1)
+
+    def forward(self, x, skip1, skip2):
+        x = torch.cat([x, skip2], dim=1)
+        x = self.conv5(x)
+        x = self.conv6(x)
+        
+        x = self.up1(x)
+        x = torch.cat([x, skip1], dim=1)
+        x = self.conv7(x)
+        x = self.conv8(x)
+        
+        x = self.final_conv(x)
+        
+        return x
+
+# ===== old
+# class UNet_Encoder(nn.Module):
+#     def __init__(self, input_channels):
+#         super().__init__()
+#         self.conv1 = nn.Conv2d(input_channels, 64, kernel_size=3, padding=1)
+#         self.conv2 = nn.Conv2d(64, 64, kernel_size=3, padding=1)
+#         self.pool1 = nn.MaxPool2d(2, 2)
+
+#         self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
+#         self.conv4 = nn.Conv2d(128, 128, kernel_size=3, padding=1)
+#         self.pool2 = nn.MaxPool2d(2, 2)
+
+#     def forward(self, x):
+#         x = F.relu(self.conv1(x))
+#         x = F.relu(self.conv2(x))
+#         skip1 = x
+#         x = self.pool1(x)
+        
+#         x = F.relu(self.conv3(x))
+#         x = F.relu(self.conv4(x))
+#         skip2 = x
+#         x = self.pool2(x)
+        
+#         return x, skip1, skip2
+
+# class UNet_Decoder(nn.Module):
+#     def __init__(self, output_channels):
+#         super().__init__()
+#         self.up1 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
+#         self.conv5 = nn.Conv2d(128, 128, kernel_size=3, padding=1)
+#         self.conv6 = nn.Conv2d(128, 64, kernel_size=3, padding=1)
+
+#         self.up2 = nn.ConvTranspose2d(64, 64, kernel_size=2, stride=2)
+#         self.conv7 = nn.Conv2d(64, 64, kernel_size=3, padding=1)
+#         self.conv8 = nn.Conv2d(64, output_channels, kernel_size=1)
+
+#     def forward(self, x, skip1, skip2):
+#         x = self.up1(x)
+#         x = x + skip2  # Concatenazione (usiamo somma per evitare troppe feature)
+#         x = F.relu(self.conv5(x))
+#         x = F.relu(self.conv6(x))
+        
+#         x = self.up2(x)
+#         x = x + skip1
+#         x = F.relu(self.conv7(x))
+#         x = self.conv8(x)
+        
+#         return x
+
 class PredRNN_Block(nn.Module):
-    def __init__(self, num_layers, num_hidden, filter_size):
+    def __init__(self, num_layers, num_hidden, filter_size, width):
         super().__init__()
         self.cells = nn.ModuleList()
         for _ in range(num_layers):
             self.cells.append(SpatiotemporalLSTMCell(
                 input_dim=num_hidden,
                 hidden_dim=num_hidden,
+                width=width,
                 filter_size=filter_size
             ))
         self.num_layers = num_layers
@@ -219,17 +364,16 @@ class PredRNN_Block(nn.Module):
 
         for t in range(seq_len):
             ##########################
-            # Fase 1: Propagazione bottom-up (da layer alto a basso)
+            # Fase 1: Propagazione verticale (da layer basso ad alto)
             ##########################
-            for l in reversed(range(self.num_layers)):
-                # Input per il layer corrente
+            for l in range(self.num_layers):
                 if l == 0:
                     input_current = input_sequence[:, t]  # Input diretto per il primo layer
                 else:
                     input_current = h_t[l-1]  # Output del layer precedente
                 
-                # Memoria del layer superiore (se esiste)
-                m_upper = m_t[l+1] if l < self.num_layers - 1 else None
+                # Memoria del layer inferiore (se esiste)
+                m_lower = m_t[l-1] if l > 0 else None
                 
                 # Aggiorna gli stati del layer
                 h_new, c_new, m_new, cell_loss = self.cells[l](
@@ -237,7 +381,7 @@ class PredRNN_Block(nn.Module):
                     h_t[l],
                     c_t[l],
                     m_t[l],
-                    m_upper
+                    m_lower
                 )
                 
                 # Aggiorna gli stati persistenti
@@ -247,11 +391,13 @@ class PredRNN_Block(nn.Module):
                 total_decouple_loss += cell_loss  # Accumula la loss
 
             ##########################
-            # Fase 2: Propagazione top-down (da layer basso ad alto)
+            # Fase 2: Propagazione orizzontale (al prossimo timestamp)
             ##########################
-            for l in range(1, self.num_layers):
-                input_current = h_t[l-1]  # Output del layer precedente
-                m_upper = m_t[l-1]  # Memoria del layer inferiore (aggiornata nella fase 1)
+            for l in reversed(range(self.num_layers)):
+                input_current = h_t[l]  # Mantieni lo stesso input
+                
+                # Memoria del layer superiore (se esiste)
+                m_upper = m_t[l+1] if l < self.num_layers - 1 else None
                 
                 # Aggiorna gli stati del layer
                 h_new, c_new, m_new, cell_loss = self.cells[l](
@@ -275,121 +421,149 @@ class PredRNN_Block(nn.Module):
 
         return torch.stack(output_inner, dim=1), h_t, c_t, m_t, total_decouple_loss
 
-class UNet_Encoder(nn.Module):
-    def __init__(self, in_channels):
-        super().__init__()
-        self.enc1 = self.contract_block(in_channels, 64, 3, 1)
-        self.enc2 = self.contract_block(64, 128, 3, 1)
-        self.pool = nn.MaxPool2d(2)
-
-    def contract_block(self, in_channels, out_channels, kernel_size, padding):
-        return nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding),
-            nn.BatchNorm2d(out_channels), 
-            nn.ReLU(),
-            nn.Conv2d(out_channels, out_channels, kernel_size, padding=padding),
-            nn.BatchNorm2d(out_channels),  
-            nn.ReLU()
-        )
-
-    def forward(self, x):
-        x1 = self.enc1(x)
-        x_pooled1 = self.pool(x1)
-        x2 = self.enc2(x_pooled1)
-        return x2, x1
-
-class UNet_Decoder(nn.Module):
-    def __init__(self, out_channels):
-        super().__init__()
-        self.upconv1 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
-        self.dec1 = self.expand_block(128, 64, 3, 1)
-        self.upconv2 = nn.Conv2d(64, out_channels, kernel_size=1)
-
-    def expand_block(self, in_channels, out_channels, kernel_size, padding):
-        return nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(),
-            nn.Conv2d(out_channels, out_channels, kernel_size, padding=padding),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU()
-        )
-
-    def forward(self, x, skip):
-        # Adattiamo la dimensione spaziale di x prima della concatenazione
-        if x.size(2) != skip.size(2) or x.size(3) != skip.size(3):
-            x = F.interpolate(x, size=(skip.size(2), skip.size(3)), mode='nearest')
-
-        # Controlliamo che i canali di skip siano 64 (tagliamo se necessario)
-        if skip.size(1) > 64:
-            skip = skip[:, :64, :, :]
-
-        # Controlliamo che i canali di x siano 64
-        if x.size(1) > 64:
-            x = x[:, :64, :, :]
-
-        # Concatenazione corretta (ora ha esattamente 128 canali)
-        x = torch.cat([x, skip], dim=1)
-        
-        x = self.dec1(x)            # Ora questa convoluzione riceve esattamente 128 canali
-        x = self.upconv2(x)         # Ultima convoluzione per generare l'output
-        return torch.sigmoid(x)
-
 class RainPredRNN(nn.Module):
-    def __init__(self, input_dim=1, num_hidden=64, num_layers=3, filter_size=3):
+    def __init__(self, input_dim=1, num_hidden=128, num_layers=3, filter_size=3):
         super().__init__()
         self.encoder = UNet_Encoder(input_dim)
         self.decoder = UNet_Decoder(input_dim)
-        self.rnn_block = PredRNN_Block(num_layers, num_hidden, filter_size)
         self.num_layers = num_layers
         self.num_hidden = num_hidden
+        self.filter_size = filter_size
 
     def forward(self, input_sequence, pred_length, teacher_forcing=False):
         batch_size, seq_len, _, h, w = input_sequence.size()
         device = input_sequence.device
+        
+        width = h // 4 
+        self.rnn_block = PredRNN_Block(self.num_layers, self.num_hidden, self.filter_size, width).to(device)
 
         encoder_skips = []
         encoder_outputs = []
         for t in range(seq_len):
-            enc_out, skip = self.encoder(input_sequence[:, t])
+            enc_out, skip1, skip2 = self.encoder(input_sequence[:, t])
             encoder_outputs.append(enc_out)
-            encoder_skips.append(skip)
+            encoder_skips.append((skip1, skip2))
 
         predictions = []
         total_decouple_loss = 0.0
 
-        h_t = [torch.zeros(batch_size, self.num_hidden, h//4, w//4).to(device) 
-            for _ in range(self.num_layers)]
-        c_t = [torch.zeros(batch_size, self.num_hidden, h//4, w//4).to(device)
-            for _ in range(self.num_layers)]
-        m_t = [torch.zeros(batch_size, self.num_hidden, h//4, w//4).to(device)
-            for _ in range(self.num_layers)]
+        h_t = [torch.zeros(batch_size, self.num_hidden, h//4, w//4).to(device) for _ in range(self.num_layers)]
+        c_t = [torch.zeros(batch_size, self.num_hidden, h//4, w//4).to(device) for _ in range(self.num_layers)]
+        m_t = [torch.zeros(batch_size, self.num_hidden, h//4, w//4).to(device) for _ in range(self.num_layers)]
 
         for t in range(seq_len + pred_length):
             if t < seq_len:
                 x = encoder_outputs[t]
+                skip1, skip2 = encoder_skips[t]
             else:
                 if teacher_forcing and self.training:
-                    x = encoder_outputs[t - seq_len]  # Usa il ground truth
+                    x = encoder_outputs[t - seq_len]
                 else:
                     prev_pred = predictions[-1] if predictions else input_sequence[:, -1]
-                    x, skip = self.encoder(prev_pred)  # Usa la predizione precedente
+                    x, skip1, skip2 = self.encoder(prev_pred)
                 
                 if self.training:
-                    encoder_skips.append(skip)
+                    encoder_skips.append((skip1, skip2))
 
-                current_skip = skip
-
-            rnn_out, h_t, c_t, m_t, decouple_loss = self.rnn_block(
-                x.unsqueeze(1), h_t, c_t, m_t
-            )
+            rnn_out, h_t, c_t, m_t, decouple_loss = self.rnn_block(x.unsqueeze(1), h_t, c_t, m_t)
             total_decouple_loss += decouple_loss
-
+            
+            rnn_out = rnn_out.squeeze(1)  # 128 canali
+            x = torch.cat([x, rnn_out], dim=1)  # Concatenazione con encoder → 256 canali
+            
             if t >= seq_len:
-                pred = self.decoder(rnn_out.squeeze(1), current_skip)
+                pred = self.decoder(x, skip1, skip2)
                 predictions.append(pred)
 
         return torch.stack(predictions, dim=1), total_decouple_loss
+
+# ==== prova chat
+# class PredRNN_Block(nn.Module):
+#     def __init__(self, num_layers, num_hidden, filter_size, width):
+#         super().__init__()
+#         self.cells = nn.ModuleList()
+#         for _ in range(num_layers):
+#             self.cells.append(SpatiotemporalLSTMCell(
+#                 input_dim=num_hidden,
+#                 hidden_dim=num_hidden,
+#                 width=width,
+#                 filter_size=filter_size
+#             ))
+#         self.num_layers = num_layers
+
+#     def forward(self, input_sequence, h_t, c_t, m_t):
+#         seq_len = input_sequence.size(1)
+#         output_inner = []
+#         total_decouple_loss = 0.0
+
+#         for t in range(seq_len):
+#             for l in range(self.num_layers):
+#                 if l == 0:
+#                     input_current = input_sequence[:, t]
+#                 else:
+#                     input_current = h_t[l-1]
+                
+#                 m_lower = m_t[l-1] if l > 0 else None
+                
+#                 h_new, c_new, m_new, cell_loss = self.cells[l](
+#                     input_current,
+#                     h_t[l],
+#                     c_t[l],
+#                     m_t[l],
+#                     m_lower
+#                 )
+#                 h_t[l] = h_new
+#                 c_t[l] = c_new
+#                 m_t[l] = m_new
+#                 total_decouple_loss += cell_loss
+
+#             output_inner.append(h_t[-1])
+        
+#         total_decouple_loss /= (seq_len * self.num_layers)
+#         return torch.stack(output_inner, dim=1), h_t, c_t, m_t, total_decouple_loss
+
+# class RainPredRNN(nn.Module):
+#     def __init__(self, input_dim=1, num_hidden=128, num_layers=3, filter_size=3):
+#         super().__init__()
+#         self.encoder = UNet_Encoder(input_dim)
+#         self.decoder = UNet_Decoder(input_dim)
+#         self.num_layers = num_layers
+#         self.num_hidden = num_hidden
+#         self.filter_size = filter_size
+
+#     def forward(self, input_sequence, pred_length, teacher_forcing=False):
+#         batch_size, seq_len, _, h, w = input_sequence.size()
+#         device = input_sequence.device
+        
+#         width = h // 4 
+#         self.rnn_block = PredRNN_Block(self.num_layers, self.num_hidden, self.filter_size, width).to(device)
+
+#         encoder_skips = []
+#         encoder_outputs = []
+#         for t in range(seq_len):
+#             enc_out, skip1, skip2 = self.encoder(input_sequence[:, t])
+#             encoder_outputs.append(enc_out)
+#             encoder_skips.append((skip1, skip2))
+
+#         predictions = []
+#         total_decouple_loss = 0.0
+        
+#         h_t = [torch.zeros(batch_size, self.num_hidden, h//4, w//4).to(device) for _ in range(self.num_layers)]
+#         c_t = [torch.zeros(batch_size, self.num_hidden, h//4, w//4).to(device) for _ in range(self.num_layers)]
+#         m_t = [torch.zeros(batch_size, self.num_hidden, h//4, w//4).to(device) for _ in range(self.num_layers)]
+
+#         for t in range(seq_len + pred_length):
+#             x = encoder_outputs[t] if t < seq_len else predictions[-1]
+#             skip1, skip2 = encoder_skips[t] if t < seq_len else encoder_skips[-1]
+            
+#             rnn_out, h_t, c_t, m_t, decouple_loss = self.rnn_block(x.unsqueeze(1), h_t, c_t, m_t)
+#             total_decouple_loss += decouple_loss
+            
+#             rnn_out = rnn_out.squeeze(1)
+#             x = torch.cat([x, rnn_out], dim=1)
+#             predictions.append(self.decoder(x, skip1, skip2))
+
+#         return torch.stack(predictions, dim=1), total_decouple_loss         
 
 # === Inizializzazione pesi ===
 def init_weights(m):
@@ -435,59 +609,37 @@ def create_dataloaders(data_path, batch_size=4, num_workers=4):
 
 # === Metriche ===
 def calculate_metrics(preds, targets, threshold_dbz=15):
-    preds = preds.cpu().numpy().squeeze()  # Converti in NumPy
+    preds = preds.cpu().numpy().squeeze()
     targets = targets.cpu().numpy().squeeze()
 
     # Denormalizza i valori (da range [0, 1] a dBZ [0, 70])
     targets_dbz = np.clip(targets * 70.0, 0, 70)
     preds_dbz = np.clip(preds * 70.0, 0, 70)
 
+    # Controllo NaN
+    if np.isnan(preds_dbz).any() or np.isnan(targets_dbz).any():
+        print("Attenzione: NaN trovati nelle immagini predette o nei target!")
+        preds_dbz = np.nan_to_num(preds_dbz, nan=0.0, posinf=0.0, neginf=0.0)
+        targets_dbz = np.nan_to_num(targets_dbz, nan=0.0, posinf=0.0, neginf=0.0)
+
     # Calcola MAE
     mae = np.mean(np.abs(preds_dbz - targets_dbz))
 
     # SSIM: Itera su batch e frames temporali
     ssim_values = []
-    for b in range(preds_dbz.shape[0]):  # Batch loop
-        for t in range(preds_dbz.shape[1]):  # Time step loop
-            try:
-                # Controllo NaN
-                if np.isnan(preds_dbz[b, t]).any() or np.isnan(targets_dbz[b, t]).any():
-                    print(f"Errore: NaN trovati a Batch {b}, Frame {t}")
-                    ssim_values.append(0.0)
-                    continue
-
-                # Controllo immagini costanti
-                if np.all(preds_dbz[b, t] == preds_dbz[b, t][0, 0]) or np.all(targets_dbz[b, t] == targets_dbz[b, t][0, 0]):
-                    print(f"Errore: Immagine costante a Batch {b}, Frame {t}")
-                    ssim_values.append(0.0)
-                    continue
-
-                # Controllo se l'immagine è completamente vuota
-                if np.all(preds_dbz[b, t] == 0) or np.all(targets_dbz[b, t] == 0):
-                    print(f"Errore: Immagine completamente vuota a Batch {b}, Frame {t}")
-                    ssim_values.append(0.0)
-                    continue
-
-                # Controllo data_range
-                data_range = targets_dbz[b, t].max() - targets_dbz[b, t].min()
-                if data_range == 0:
-                    print(f"Errore: data_range=0 a Batch {b}, Frame {t}. SSIM impostato a 0.")
-                    ssim_values.append(0.0)
-                    continue
-
-                # Calcolo SSIM sicuro
-                ssim_t = ssim(
-                    preds_dbz[b, t], targets_dbz[b, t],  
-                    data_range=data_range,  
-                    win_size=5,  
-                    multichannel=False
-                )
-                ssim_values.append(ssim_t)
-            except Exception as e:
-                print(f"Errore sconosciuto nel calcolo SSIM per Batch {b}, Frame {t}: {e}")
-                ssim_values.append(0.0)  # Evita crash
-
-    ssim_val = np.mean(ssim_values) if ssim_values else 0.0  # Media su tutti i frame
+    for b in range(preds_dbz.shape[0]):
+        for t in range(preds_dbz.shape[1]):
+            data_range = max(targets_dbz[b, t].max() - targets_dbz[b, t].min(), 1e-6)  # Evita zero division
+            
+            # Controllo immagini costanti
+            if np.std(targets_dbz[b, t]) < 1e-6 or np.std(preds_dbz[b, t]) < 1e-6:
+                ssim_t = 1.0  # Se non c'è variazione, assegna un SSIM perfetto
+            else:
+                ssim_t = ssim(preds_dbz[b, t], targets_dbz[b, t], data_range=data_range, win_size=5, multichannel=False)
+            
+            ssim_values.append(ssim_t)
+    
+    ssim_val = np.mean(ssim_values) if ssim_values else 0.0
 
     # Binarizza con soglia di 15 dBZ
     preds_bin = (preds_dbz > threshold_dbz).astype(np.uint8)
@@ -497,7 +649,12 @@ def calculate_metrics(preds, targets, threshold_dbz=15):
     cm = confusion_matrix(targets_bin.flatten(), preds_bin.flatten(), labels=[0, 1])
 
     # Gestione robusta della matrice di confusione
-    tn, fp, fn, tp = cm.ravel() if cm.shape == (2, 2) else (0, 0, 0, cm[0, 0] if cm.shape == (1, 1) else 0)
+    if cm.shape == (2, 2):
+        tn, fp, fn, tp = cm.ravel()
+    elif cm.shape == (1, 1):
+        tn, fp, fn, tp = 0, 0, 0, cm[0, 0]
+    else:
+        tn, fp, fn, tp = 0, 0, 0, 0
 
     # Calcola il CSI
     csi = tp / (tp + fp + fn + 1e-10)  # Evita divisione per zero
@@ -509,7 +666,7 @@ def calculate_metrics(preds, targets, threshold_dbz=15):
     }
 
 # === Training loop ===
-def train_epoch(model, loader, optimizer, device):
+def train_epoch(model, loader, optimizer, device, scaler=None):
     model.train()
     total_loss = 0.0
 
@@ -517,30 +674,26 @@ def train_epoch(model, loader, optimizer, device):
         inputs, targets = inputs.to(device), targets.to(device)
         optimizer.zero_grad()
 
-        with autocast():
+        # Se si usa Mixed Precision, usa autocast
+        with torch.cuda.amp.autocast(enabled=(scaler is not None)):
             outputs, decouple_loss = model(inputs, PRED_LENGTH, teacher_forcing=True)
 
-            ssim_loss = 0
-            for t in range(outputs.shape[1]):  # Loop su ogni timestep
-                # Assicurati che non ci siano NaN nei tensor
-                if torch.isnan(outputs[:, t]).any() or torch.isnan(targets[:, t]).any():
-                    print(f" Warning: NaN found in batch at timestep {t}")
-                    continue  # Salta il frame con NaN
+            # Controlliamo che `decouple_loss` sia scalare
+            decouple_loss = decouple_loss.mean() if isinstance(decouple_loss, torch.Tensor) else torch.tensor(decouple_loss, device=device)
 
-                # Calcolo SSIM per il frame corrente
-                ssim_loss += 1 - criterion_ssim(outputs[:, t], targets[:, t])
+            # Calcoliamo la loss totale
+            loss = criterion_mse(outputs, targets).mean() + LAMBDA_DECOUPLE * (decouple_loss / (INPUT_LENGTH + PRED_LENGTH))
 
-            # Media su tutti i frame
-            ssim_loss /= outputs.shape[1]
+        # Backpropagation
+        if scaler:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
 
-            # Loss totale
-            loss = criterion_mae(outputs, targets) + 0.5 * ssim_loss + LAMBDA_DECOUPLE * (decouple_loss / (INPUT_LENGTH + PRED_LENGTH))
-
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
         total_loss += loss.item()
-
         torch.cuda.empty_cache()
 
     return total_loss / len(loader)
@@ -621,7 +774,8 @@ def save_predictions_single_test(predictions, output_dir="outputs/custom_test"):
 torch.cuda.empty_cache()
 model = RainPredRNN(input_dim=1, num_hidden=128, num_layers=3, filter_size=3)
 model.apply(init_weights)
-model = DataParallel(model).to(DEVICE)
+# model = DataParallel(model).to(DEVICE)
+model = model.to(DEVICE)
 
 # === Ottimizzatore e loss ===
 optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
@@ -660,7 +814,12 @@ if __name__ == "__main__":
             torch.save(model.state_dict(), os.path.join(CHECKPOINT_DIR, "best_model.pth"))
     
     # Test finale
-    model.load_state_dict(torch.load(os.path.join(CHECKPOINT_DIR, "best_model.pth")))
+    # model.load_state_dict(torch.load(os.path.join(CHECKPOINT_DIR, "best_model.pth"))) # per data parallel
+
+    state_dict = torch.load(os.path.join(CHECKPOINT_DIR, "best_model.pth"))
+    new_state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+    model.load_state_dict(new_state_dict)
+
     test_metrics = evaluate(model, test_loader, DEVICE)
     print("Test Results:")
     print(f"\tMAE: {test_metrics['MAE']:.4f}")

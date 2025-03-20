@@ -72,7 +72,7 @@ class RadarDataset(Dataset):
         self.is_train = is_train
         self.transform = transforms.Compose([
             # transforms.Resize((600, 700)),
-            transforms.CenterCrop((350, 350)),
+            transforms.CenterCrop((256, 256)),
             transforms.ToTensor(),
         ])
         # Cache per tenere traccia della validità dei file
@@ -485,37 +485,37 @@ def create_dataloaders(data_path, batch_size=4, num_workers=4):
 
 # === Metriche ===
 def calculate_metrics(preds, targets, threshold_dbz=15):
-    preds = preds.cpu().numpy().squeeze()  # Converti in NumPy
+    preds = preds.cpu().numpy().squeeze()
     targets = targets.cpu().numpy().squeeze()
 
     # Denormalizza i valori (da range [0, 1] a dBZ [0, 70])
     targets_dbz = np.clip(targets * 70.0, 0, 70)
     preds_dbz = np.clip(preds * 70.0, 0, 70)
 
+    # Controllo NaN
+    if np.isnan(preds_dbz).any() or np.isnan(targets_dbz).any():
+        print("Attenzione: NaN trovati nelle immagini predette o nei target!")
+        preds_dbz = np.nan_to_num(preds_dbz, nan=0.0, posinf=0.0, neginf=0.0)
+        targets_dbz = np.nan_to_num(targets_dbz, nan=0.0, posinf=0.0, neginf=0.0)
+
     # Calcola MAE
     mae = np.mean(np.abs(preds_dbz - targets_dbz))
 
     # SSIM: Itera su batch e frames temporali
     ssim_values = []
-    for b in range(preds_dbz.shape[0]):  # Batch loop
-        for t in range(preds_dbz.shape[1]):  # Time step loop
-            try:
-                # Assicura che i valori siano corretti per SSIM
-                if np.isnan(preds_dbz[b, t]).any() or np.isnan(targets_dbz[b, t]).any():
-                    raise ValueError("Valori NaN trovati nelle immagini.")
-
-                ssim_t = ssim(
-                    preds_dbz[b, t], targets_dbz[b, t],  
-                    data_range=targets_dbz[b, t].max() - targets_dbz[b, t].min(),  # Data range dinamico
-                    win_size=5,  # Finestra più grande per evitare artefatti
-                    multichannel=False
-                )
-                ssim_values.append(ssim_t)
-            except ValueError as e:
-                print(f"Errore nel calcolo SSIM per batch {b}, frame {t}: {e}")
-                ssim_values.append(0.0)  # Evita NaN
-
-    ssim_val = np.mean(ssim_values) if ssim_values else 0.0  # Media su tutti i frame
+    for b in range(preds_dbz.shape[0]):
+        for t in range(preds_dbz.shape[1]):
+            data_range = max(targets_dbz[b, t].max() - targets_dbz[b, t].min(), 1e-6)  # Evita zero division
+            
+            # Controllo immagini costanti
+            if np.std(targets_dbz[b, t]) < 1e-6 or np.std(preds_dbz[b, t]) < 1e-6:
+                ssim_t = 1.0  # Se non c'è variazione, assegna un SSIM perfetto
+            else:
+                ssim_t = ssim(preds_dbz[b, t], targets_dbz[b, t], data_range=data_range, win_size=5, multichannel=False)
+            
+            ssim_values.append(ssim_t)
+    
+    ssim_val = np.mean(ssim_values) if ssim_values else 0.0
 
     # Binarizza con soglia di 15 dBZ
     preds_bin = (preds_dbz > threshold_dbz).astype(np.uint8)
@@ -525,7 +525,12 @@ def calculate_metrics(preds, targets, threshold_dbz=15):
     cm = confusion_matrix(targets_bin.flatten(), preds_bin.flatten(), labels=[0, 1])
 
     # Gestione robusta della matrice di confusione
-    tn, fp, fn, tp = cm.ravel() if cm.shape == (2, 2) else (0, 0, 0, cm[0, 0] if cm.shape == (1, 1) else 0)
+    if cm.shape == (2, 2):
+        tn, fp, fn, tp = cm.ravel()
+    elif cm.shape == (1, 1):
+        tn, fp, fn, tp = 0, 0, 0, cm[0, 0]
+    else:
+        tn, fp, fn, tp = 0, 0, 0, 0
 
     # Calcola il CSI
     csi = tp / (tp + fp + fn + 1e-10)  # Evita divisione per zero
@@ -698,7 +703,12 @@ if __name__ == "__main__":
             torch.save(model.state_dict(), os.path.join(CHECKPOINT_DIR, "best_model.pth"))
     
     # Test finale
-    model.load_state_dict(torch.load(os.path.join(CHECKPOINT_DIR, "best_model.pth")))
+    # model.load_state_dict(torch.load(os.path.join(CHECKPOINT_DIR, "best_model.pth"))) # per data parallel
+
+    state_dict = torch.load(os.path.join(CHECKPOINT_DIR, "best_model.pth"))
+    new_state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+    model.load_state_dict(new_state_dict)
+
     test_metrics = evaluate(model, test_loader, DEVICE)
     print("Test Results:")
     print(f"\tMAE: {test_metrics['MAE']:.4f}")

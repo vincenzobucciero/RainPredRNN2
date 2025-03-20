@@ -699,7 +699,13 @@ if __name__ == "__main__":
             torch.save(model.state_dict(), os.path.join(CHECKPOINT_DIR, "best_model.pth"))
     
     # Test finale
-    model.load_state_dict(torch.load(os.path.join(CHECKPOINT_DIR, "best_model.pth")))
+    # model.load_state_dict(torch.load(os.path.join(CHECKPOINT_DIR, "best_model.pth"))) # per data parallel
+
+    state_dict = torch.load(os.path.join(CHECKPOINT_DIR, "best_model.pth"))
+    new_state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+    model.load_state_dict(new_state_dict)
+
+
     test_metrics = evaluate(model, test_loader, DEVICE)
     print("Test Results:")
     print(f"\tMAE: {test_metrics['MAE']:.4f}")
