@@ -4,4 +4,5 @@ rasterio
 scikit-image
 scikit-learn
 torchvision
+pytorch_msssim
 thop

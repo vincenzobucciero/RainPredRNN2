@@ -72,7 +72,7 @@ class RadarDataset(Dataset):
         self.is_train = is_train
         self.transform = transforms.Compose([
             # transforms.Resize((600, 700)),
-            transforms.CenterCrop((256, 256)),
+            transforms.CenterCrop((128, 128)),
             transforms.ToTensor(),
         ])
         # Cache per tenere traccia della validità dei file
@@ -430,52 +430,50 @@ class RainPredRNN(nn.Module):
         self.num_hidden = num_hidden
         self.filter_size = filter_size
 
-    def forward(self, input_sequence, pred_length, teacher_forcing=False):
-        batch_size, seq_len, _, h, w = input_sequence.size()
+    def forward(self, input_sequence, pred_length, teacher_forcing=False): 
+        batch_size, seq_len, _, h, w = input_sequence.size() 
         device = input_sequence.device
-        
-        width = h // 4 
-        self.rnn_block = PredRNN_Block(self.num_layers, self.num_hidden, self.filter_size, width).to(device)
 
-        encoder_skips = []
-        encoder_outputs = []
-        for t in range(seq_len):
-            enc_out, skip1, skip2 = self.encoder(input_sequence[:, t])
-            encoder_outputs.append(enc_out)
-            encoder_skips.append((skip1, skip2))
+        # L'encoder produce feature map con dimensione spaziale h/2 e w/2
+        width = h // 2  
+        self.rnn_block = PredRNN_Block(self.num_layers, self.num_hidden, self.filter_size, width).to(device)
 
         predictions = []
         total_decouple_loss = 0.0
 
-        h_t = [torch.zeros(batch_size, self.num_hidden, h//4, w//4).to(device) for _ in range(self.num_layers)]
-        c_t = [torch.zeros(batch_size, self.num_hidden, h//4, w//4).to(device) for _ in range(self.num_layers)]
-        m_t = [torch.zeros(batch_size, self.num_hidden, h//4, w//4).to(device) for _ in range(self.num_layers)]
+        # Inizializzazione degli stati con dimensione coerente (h/2 x w/2)
+        h_t = [torch.zeros(batch_size, self.num_hidden, h//2, w//2).to(device) for _ in range(self.num_layers)]
+        c_t = [torch.zeros(batch_size, self.num_hidden, h//2, w//2).to(device) for _ in range(self.num_layers)]
+        m_t = [torch.zeros(batch_size, self.num_hidden, h//2, w//2).to(device) for _ in range(self.num_layers)]
 
+        # Loop sui timestep totali (input + predizioni)
         for t in range(seq_len + pred_length):
             if t < seq_len:
-                x = encoder_outputs[t]
-                skip1, skip2 = encoder_skips[t]
+                # Usa sempre l'encoder sui frame di input
+                x, skip1, skip2 = self.encoder(input_sequence[:, t])
             else:
+                # Per t >= seq_len, ricalcola l'encoder sul frame da usare:
                 if teacher_forcing and self.training:
-                    x = encoder_outputs[t - seq_len]
+                    # Usa il ground truth corrispondente
+                    x, skip1, skip2 = self.encoder(input_sequence[:, t - seq_len])
                 else:
+                    # Usa l'ultimo frame predetto
                     prev_pred = predictions[-1] if predictions else input_sequence[:, -1]
                     x, skip1, skip2 = self.encoder(prev_pred)
-                
-                if self.training:
-                    encoder_skips.append((skip1, skip2))
 
+            # Passa x al blocco RNN (ricorda che l'encoder restituisce x con 128 canali)
             rnn_out, h_t, c_t, m_t, decouple_loss = self.rnn_block(x.unsqueeze(1), h_t, c_t, m_t)
             total_decouple_loss += decouple_loss
-            
-            rnn_out = rnn_out.squeeze(1)  # 128 canali
-            x = torch.cat([x, rnn_out], dim=1)  # Concatenazione con encoder → 256 canali
-            
+            rnn_out = rnn_out.squeeze(1)  # rnn_out ha forma (B, 128, h/2, w/2)
+
+            # Passa al decoder: concatenazione di rnn_out (128 canali) con skip2 (dovrebbe essere 128 canali)
             if t >= seq_len:
-                pred = self.decoder(x, skip1, skip2)
+                pred = self.decoder(rnn_out, skip1, skip2)
                 predictions.append(pred)
 
         return torch.stack(predictions, dim=1), total_decouple_loss
+
+
 
 # ==== prova chat
 # class PredRNN_Block(nn.Module):
