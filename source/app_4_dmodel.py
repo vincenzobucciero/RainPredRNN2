@@ -12,6 +12,7 @@ from rasterio.errors import RasterioIOError
 from skimage.metrics import structural_similarity as ssim
 from sklearn.metrics import confusion_matrix
 from pytorch_msssim import SSIM
+import torchio as tio
 from PIL import Image
 import datetime
 import torchvision.transforms as transforms
@@ -58,6 +59,12 @@ def set_seed(seed=15):
 set_seed()
 
 # === Dataset ===
+def get_augmentation_transforms():
+    return tio.Compose([
+        tio.RandomFlip(axes=(0, 1), p=0.5),  # Flip casuale lungo gli assi x e y
+        tio.RandomAffine(scales=(0.9, 1.1), degrees=10, p=0.5),  # Rotazioni e zoom casuali
+    ])
+
 class RadarDataset(Dataset):
     def __init__(self, data_path, input_length=6, pred_length=6, is_train=True):
         self.input_length = input_length
@@ -132,25 +139,24 @@ class UNet_Encoder(nn.Module):
     def __init__(self, input_channels):
         super().__init__()
         self.conv1 = nn.Sequential(
-            nn.Conv2d(input_channels, 64, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(64),
+            nn.Conv2d(input_channels, 32, kernel_size=3, padding=1, bias=False),  # Modificato da 64 a 32
+            nn.BatchNorm2d(32),
             nn.ReLU(inplace=True)
         )
         self.conv2 = nn.Sequential(
-            nn.Conv2d(64, 64, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(64),
+            nn.Conv2d(32, 32, kernel_size=3, padding=1, bias=False),  # Modificato da 64 a 32
+            nn.BatchNorm2d(32),
             nn.ReLU(inplace=True)
         )
         self.pool1 = nn.MaxPool2d(2, 2)
-        
         self.conv3 = nn.Sequential(
-            nn.Conv2d(64, 128, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(128),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1, bias=False),  # Modificato da 128 a 64
+            nn.BatchNorm2d(64),
             nn.ReLU(inplace=True)
         )
         self.conv4 = nn.Sequential(
-            nn.Conv2d(128, 128, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(128),
+            nn.Conv2d(64, 32, kernel_size=3, padding=1, bias=False),  # Modificato da 128 a 32
+            nn.BatchNorm2d(32),
             nn.ReLU(inplace=True)
         )
 
@@ -168,27 +174,27 @@ class UNet_Decoder(nn.Module):
     def __init__(self, output_channels):
         super().__init__()
         self.conv5 = nn.Sequential(
-            nn.Conv2d(256, 128, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(128),
+            nn.Conv2d(64, 32, kernel_size=3, padding=1, bias=False),  # Modificato da 256 a 64 e da 128 a 32
+            nn.BatchNorm2d(32),
             nn.ReLU(inplace=True)
         )
         self.conv6 = nn.Sequential(
-            nn.Conv2d(128, 128, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(128),
+            nn.Conv2d(32, 32, kernel_size=3, padding=1, bias=False),  # Modificato da 128 a 32
+            nn.BatchNorm2d(32),
             nn.ReLU(inplace=True)
         )
-        self.up1 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
+        self.up1 = nn.ConvTranspose2d(32, 32, kernel_size=2, stride=2)  # Modificato da 64 a 32
         self.conv7 = nn.Sequential(
-            nn.Conv2d(128, 64, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(64),
+            nn.Conv2d(64, 32, kernel_size=3, padding=1, bias=False),  # Modificato da 128 a 32
+            nn.BatchNorm2d(32),
             nn.ReLU(inplace=True)
         )
         self.conv8 = nn.Sequential(
-            nn.Conv2d(64, 64, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(64),
+            nn.Conv2d(32, 32, kernel_size=3, padding=1, bias=False),  # Modificato da 64 a 32
+            nn.BatchNorm2d(32),
             nn.ReLU(inplace=True)
         )
-        self.final_conv = nn.Conv2d(64, output_channels, kernel_size=1)
+        self.final_conv = nn.Conv2d(32, output_channels, kernel_size=1)  # Nessuna modifica necessaria qui
 
     def forward(self, x, skip1, skip2):
         x = torch.cat([x, skip2], dim=1)
@@ -260,7 +266,7 @@ class TemporalTransformerBlock(nn.Module):
 
 # === Modello principale: RainPredRNN modificato per usare il Transformer ===
 class RainPredRNN(nn.Module):
-    def __init__(self, input_dim=1, num_hidden=128, num_layers=3, filter_size=3):
+    def __init__(self, input_dim=1, num_hidden=32, num_layers=3, filter_size=3):
         super().__init__()
         self.encoder = UNet_Encoder(input_dim)
         self.decoder = UNet_Decoder(input_dim)
