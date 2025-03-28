@@ -12,9 +12,9 @@ from rasterio.errors import RasterioIOError
 from skimage.metrics import structural_similarity as ssim
 from sklearn.metrics import confusion_matrix
 from pytorch_msssim import SSIM
-import torchio as tio
 from PIL import Image
 import datetime
+import torchio as tio
 import torchvision.transforms as transforms
 from torch.utils.tensorboard import SummaryWriter
 import glob
@@ -31,7 +31,7 @@ DEVICE = get_device()
 NUM_WORKERS = 8
 BATCH_SIZE = 4
 LEARNING_RATE = 0.0001
-NUM_EPOCHS = 50
+NUM_EPOCHS = 100
 INPUT_LENGTH = 6
 PRED_LENGTH = 6
 LAMBDA_DECOUPLE = 0.001
@@ -54,7 +54,7 @@ def set_seed(seed=15):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = False
     torch.backends.cudnn.benchmark = True
-    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128,expandable_segments:True'
 
 set_seed()
 
@@ -76,12 +76,15 @@ class RadarDataset(Dataset):
             transforms.Resize((200, 200)),
             #transforms.CenterCrop((256, 256)),
             transforms.ToTensor(),
-            #transforms.Normalize(mean=[0.5], std=[0.5])
+            transforms.Normalize(mean=[0.5], std=[0.5])
         ])
         self.file_validity = {}
         self.valid_indices = []
         self.total_possible_windows = max(0, len(self.files) - self.seq_length + 1)
         
+        # Inizializza le trasformazioni di augmentazione solo per il training
+        self.augmentation_transforms = get_augmentation_transforms() if is_train else None
+
         for start_idx in range(self.total_possible_windows):
             window_valid = True
             for i in range(self.seq_length):
@@ -112,6 +115,7 @@ class RadarDataset(Dataset):
         print(f"3. Finestre totali possibili: {self.total_possible_windows}")
         print(f"4. Finestre valide: {self.valid_windows}")
         print(f"5. Finestre non valide: {self.invalid_windows}")
+        #print(f"6. Indici validi: {self.valid_indices}")
         print(" ===================================================== \n")
 
     def __len__(self):
@@ -128,10 +132,22 @@ class RadarDataset(Dataset):
                 img = Image.fromarray(img)
                 img = self.transform(img)
                 images.append(img)
+        all_frames = torch.stack(images)  # Shape: (seq_length, C, H, W) -> (12, 1, 200, 200)
         
-        inputs = torch.stack(images[:self.input_length])
-        targets = torch.stack(images[self.input_length:])
-
+        # Riordina le dimensioni: da (seq_length, C, H, W) a (C, seq_length, H, W)
+        all_frames = all_frames.permute(1, 0, 2, 3)  # Shape: (1, 12, 200, 200)
+        
+        inputs = all_frames[:, :self.input_length]  # Shape: (1, 6, 200, 200)
+        targets = all_frames[:, self.input_length:]  # Shape: (1, 6, 200, 200)
+        
+        if self.is_train and self.augmentation_transforms is not None:
+            transformed = self.augmentation_transforms(all_frames)
+            inputs = transformed[:, :self.input_length]  # Shape: (1, 6, 200, 200)
+            targets = transformed[:, self.input_length:]  # Shape: (1, 6, 200, 200)
+        
+        inputs = inputs.permute(1, 0, 2, 3)  # Shape: (6, 1, 200, 200)
+        targets = targets.permute(1, 0, 2, 3)  # Shape: (6, 1, 200, 200)
+        
         return inputs, targets
 
 # === UNet Encoder e Decoder (invariati) ===
@@ -139,23 +155,24 @@ class UNet_Encoder(nn.Module):
     def __init__(self, input_channels):
         super().__init__()
         self.conv1 = nn.Sequential(
-            nn.Conv2d(input_channels, 32, kernel_size=3, padding=1, bias=False),  # Modificato da 64 a 32
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True)
-        )
-        self.conv2 = nn.Sequential(
-            nn.Conv2d(32, 32, kernel_size=3, padding=1, bias=False),  # Modificato da 64 a 32
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True)
-        )
-        self.pool1 = nn.MaxPool2d(2, 2)
-        self.conv3 = nn.Sequential(
-            nn.Conv2d(32, 64, kernel_size=3, padding=1, bias=False),  # Modificato da 128 a 64
+            nn.Conv2d(input_channels, 64, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True)
         )
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(64, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True)
+        )
+        self.pool1 = nn.MaxPool2d(2, 2)
+        
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(64, 128, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True)
+        )
         self.conv4 = nn.Sequential(
-            nn.Conv2d(64, 32, kernel_size=3, padding=1, bias=False),  # Modificato da 128 a 32
+            nn.Conv2d(128, 32, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(32),
             nn.ReLU(inplace=True)
         )
@@ -174,27 +191,27 @@ class UNet_Decoder(nn.Module):
     def __init__(self, output_channels):
         super().__init__()
         self.conv5 = nn.Sequential(
-            nn.Conv2d(64, 32, kernel_size=3, padding=1, bias=False),  # Modificato da 256 a 64 e da 128 a 32
-            nn.BatchNorm2d(32),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
             nn.ReLU(inplace=True)
         )
         self.conv6 = nn.Sequential(
-            nn.Conv2d(32, 32, kernel_size=3, padding=1, bias=False),  # Modificato da 128 a 32
-            nn.BatchNorm2d(32),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
             nn.ReLU(inplace=True)
         )
-        self.up1 = nn.ConvTranspose2d(32, 32, kernel_size=2, stride=2)  # Modificato da 64 a 32
+        self.up1 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
         self.conv7 = nn.Sequential(
-            nn.Conv2d(64, 32, kernel_size=3, padding=1, bias=False),  # Modificato da 128 a 32
-            nn.BatchNorm2d(32),
+            nn.Conv2d(128, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
             nn.ReLU(inplace=True)
         )
         self.conv8 = nn.Sequential(
-            nn.Conv2d(32, 32, kernel_size=3, padding=1, bias=False),  # Modificato da 64 a 32
-            nn.BatchNorm2d(32),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
             nn.ReLU(inplace=True)
         )
-        self.final_conv = nn.Conv2d(32, output_channels, kernel_size=1)  # Nessuna modifica necessaria qui
+        self.final_conv = nn.Conv2d(64, output_channels, kernel_size=1)
 
     def forward(self, x, skip1, skip2):
         x = torch.cat([x, skip2], dim=1)
@@ -205,6 +222,7 @@ class UNet_Decoder(nn.Module):
         x = self.conv7(x)
         x = self.conv8(x)
         x = self.final_conv(x)
+        x = torch.tanh(x)
         return x
 
 # === Nuovo modulo: Transformer per la modellazione temporale ===
@@ -462,10 +480,19 @@ def save_predictions_single_test(predictions, output_dir="outputs/custom_test"):
 timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 log_dir = os.path.join("/home/f.demicco/RainPredRNN2/runs/", timestamp)
 os.makedirs(log_dir, exist_ok=True)
-writer = SummaryWriter(log_dir=log_dir)
+
+# Crea le sottocartelle per Train e Validation
+train_log_dir = os.path.join(log_dir, "Train")
+val_log_dir = os.path.join(log_dir, "Validation")
+os.makedirs(train_log_dir, exist_ok=True)
+os.makedirs(val_log_dir, exist_ok=True)
+
+# Inizializza i writer per Train e Validation
+train_writer = SummaryWriter(log_dir=train_log_dir)
+val_writer = SummaryWriter(log_dir=val_log_dir)
 
 torch.cuda.empty_cache()
-model = RainPredRNN(input_dim=1, num_hidden=128, num_layers=3, filter_size=3)
+model = RainPredRNN(input_dim=1, num_hidden=32, num_layers=3, filter_size=3)
 model = model.to(DEVICE)
 
 optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
@@ -473,7 +500,7 @@ scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
 criterion_mse = nn.MSELoss()
 criterion_mae = nn.L1Loss()
 criterion_ssim = SSIM(data_range=1.0, size_average=True, channel=1, win_size=5)
-scaler = torch.amp.GradScaler('cuda')
+scaler = torch.amp.GradScaler('cuda', enabled=True)
 
 # === Main ===
 if __name__ == "__main__":
@@ -482,6 +509,13 @@ if __name__ == "__main__":
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     
     train_loader, val_loader, test_loader = create_dataloaders(DATA_PATH, BATCH_SIZE, NUM_WORKERS)
+
+    #if os.path.exists(os.path.join(CHECKPOINT_DIR, "best_model.pth")):
+    # checkpoint = torch.load(os.path.join(CHECKPOINT_DIR, "best_model.pth"), weights_only=True)
+    # checkpoint = {k.replace("module.", ""): v for k, v in checkpoint.items()}
+    # model.load_state_dict(checkpoint['model_state_dict'])
+    # optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    # epoch = checkpoint['epoch']
     
     best_val_loss = float('inf')
     for epoch in range(NUM_EPOCHS):
@@ -492,18 +526,26 @@ if __name__ == "__main__":
         print(f"\tTrain Loss: {train_loss:.4f}")
         print(f"\tVal MAE: {val_metrics['MAE']:.4f}, SSIM: {val_metrics['SSIM']:.4f}, CSI: {val_metrics['CSI']:.4f}")
 
-        # writer.add_scalar("Train-Loss", train_loss, epoch)
-        # writer.add_scalar("Validation-Loss", val_metrics['MSE'], epoch)
+        train_writer.add_scalar("Loss", train_loss, epoch)
+        val_writer.add_scalar("Loss", val_metrics['MSE'], epoch)
 
-        writer.add_scalars("Loss", {"Train": train_loss, "Validation": val_metrics['MSE']}, epoch)
+        # writer.add_scalars("Loss", {"Train": train_loss, "Validation": val_metrics['MSE']}, epoch)
         
         if val_metrics['MAE'] < best_val_loss:
             best_val_loss = val_metrics['MAE']
-            torch.save(model.state_dict(), os.path.join(CHECKPOINT_DIR, "best_model.pth"))
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                }, os.path.join(CHECKPOINT_DIR, "best_model.pth"))
+
+            # torch.save(model.state_dict(), os.path.join(CHECKPOINT_DIR, "best_model.pth"))
     
     state_dict = torch.load(os.path.join(CHECKPOINT_DIR, "best_model.pth"))
     new_state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
-    model.load_state_dict(new_state_dict)
+    model.load_state_dict(new_state_dict['model_state_dict'])
+    optimizer.load_state_dict(new_state_dict['optimizer_state_dict'])
+    epoch = new_state_dict['epoch']
 
     test_metrics = evaluate(model, test_loader, DEVICE)
     print("Test Results:")
@@ -526,9 +568,8 @@ if __name__ == "__main__":
         for i, (inputs, targets) in enumerate(test_loader):
             inputs = inputs.to(DEVICE)
             outputs, _ = model(inputs, PRED_LENGTH)
-            writer.add_images("Input-Sequence", inputs[0])  # (T, C, H, W)
-            writer.add_images("Output-Sequence", outputs[0])
             save_predictions(outputs, f"/home/f.demicco/RainPredRNN2/test_predictions/batch_{i:04d}")
 
     print("Predizioni salvate correttamente")
-    writer.close()
+    train_writer.close()
+    val_writer.close()
