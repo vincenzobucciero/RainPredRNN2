@@ -9,6 +9,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.cuda.amp import GradScaler, autocast  # Per mixed-precision
 import rasterio
 from rasterio.errors import RasterioIOError
+from rasterio.transform import from_origin
 from skimage.metrics import structural_similarity as ssim
 from sklearn.metrics import confusion_matrix
 from pytorch_msssim import SSIM
@@ -40,6 +41,7 @@ LEARNING_RATE = 0.0001
 NUM_EPOCHS = 100
 INPUT_LENGTH = 6
 PRED_LENGTH = 6
+CROP_DIM = 352
 LAMBDA_DECOUPLE = 0.001
 
 # Normalizzazione delle immagini
@@ -72,15 +74,15 @@ def get_augmentation_transforms():
     ])
 
 class RadarDataset(Dataset):
-    def __init__(self, data_path, input_length=6, pred_length=6, is_train=True):
+    def __init__(self, data_path, input_length=INPUT_LENGTH, pred_length=PRED_LENGTH, is_train=True):
         self.input_length = input_length
         self.pred_length = pred_length
         self.seq_length = input_length + pred_length
         self.files = sorted(glob.glob(os.path.join(data_path, '**/*.tiff'), recursive=True))
         self.is_train = is_train
         self.transform = transforms.Compose([
-            transforms.Resize((448, 448)),
-            # transforms.CenterCrop((448, 448)),
+            # transforms.Resize((CROP_DIM, CROP_DIM)),
+            transforms.CenterCrop((CROP_DIM, CROP_DIM)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.5], std=[0.5])
         ])
@@ -267,7 +269,12 @@ class TemporalTransformerBlock(nn.Module):
         self.to_feature_map = nn.Sequential(
             nn.Linear(d_model, patch_dim),
             nn.LayerNorm(patch_dim),
-            Rearrange('b (t h w) (p1 p2 c) -> b t c (h p1) (w p2)', t=pred_length, h=7, w=7, p1=patch_size, p2=patch_size), # h e w = 224/2 / patch_size
+            Rearrange('b (t h w) (p1 p2 c) -> b t c (h p1) (w p2)', 
+                      t=pred_length, 
+                      h=(CROP_DIM // 2 // patch_size), 
+                      w=(CROP_DIM // 2 // patch_size), 
+                      p1=patch_size, 
+                      p2=patch_size), # h e w = CROP_DIM // 2 // patch_size
         )
         '''
         self.transformer = nn.Transformer(
@@ -313,43 +320,9 @@ class TemporalTransformerBlock(nn.Module):
         #print('out shape 1', out.shape)
         return out
 
-    def forward_old(self, input_sequence):
-        # input_sequence: (B, T_in, C, H, W) dove C == d_model
-        B, T, C, H, W = input_sequence.size()
-        # Riorganizza in modo da applicare la Transformer lungo la dimensione temporale per ogni posizione spaziale
-        # Portiamo le dimensioni spaziali all'esterno: (B, H, W, T, C)
-        x = input_sequence.permute(0, 3, 4, 1, 2)  # (B, H, W, T, C)
-        B, H, W, T, C = x.size()
-        N = H * W
-        x = x.reshape(B * N, T, C)  # (B*N, T, C)
-        # Transformer richiede shape (T, batch, C)
-        x = x.transpose(0, 1)  # (T, B*N, C)
-        
-        # Aggiungi positional encoding all'encoder
-        pe_enc = generate_positional_encoding(T, C, x.device)  # (T, 1, C)
-        encoder_input = x + pe_enc
-        
-        # Encoder del Transformer
-        memory = self.transformer.encoder(encoder_input)
-        
-        # # Prepara il decoder con target inizializzati a zero per pred_length passi
-        # tgt = torch.zeros(self.pred_length, B * N, C, device=x.device)
-        # pe_dec = generate_positional_encoding(self.pred_length, C, x.device)  # (pred_length, 1, C)
-        # tgt = tgt + pe_dec
-        
-        # # Decoder del Transformer: predice la sequenza futura
-        # out = self.transformer.decoder(tgt, memory)  # (pred_length, B*N, C)
-        
-        # Ritorna alla forma originale
-        out = memory
-        out = out.transpose(0, 1)  # (B*N, pred_length, C)
-        out = out.reshape(B, H, W, self.pred_length, C)  # (B, H, W, pred_length, C)
-        out = out.permute(0, 3, 4, 1, 2)  # (B, pred_length, C, H, W)
-        return out
-
 # === Modello principale: RainPredRNN modificato per usare il Transformer ===
 class RainPredRNN(nn.Module):
-    def __init__(self, input_dim=1, num_hidden=32, num_layers=3, filter_size=3, patch_size=16):
+    def __init__(self, input_dim=1, num_hidden=128, num_layers=3, filter_size=3, patch_size=16):
         super().__init__()
         self.encoder = UNet_Encoder(input_dim)
         self.decoder = UNet_Decoder(input_dim)
@@ -547,9 +520,9 @@ def save_predictions(predictions, output_dir="outputs", crs="EPSG:4326", transfo
         preds = preds.squeeze(2) 
     for batch_idx, seq in enumerate(preds):
         for t in range(seq.shape[0]):
-            frame = (seq[t] * 255.0).astype(np.uint8)
+            frame = (seq[t] * 70.0).clip(0, 255).astype(np.uint8)
             if transform is None:
-                transform = Image.from_origin(0, frame.shape[0], 1, 1)
+                transform = from_origin(0, frame.shape[0], 1, 1)
             filename = os.path.join(output_dir, f"pred_{batch_idx:04d}_t{t+1}.tiff")
             with rasterio.open(
                 filename,
@@ -594,7 +567,7 @@ train_writer = SummaryWriter(log_dir=train_log_dir)
 val_writer = SummaryWriter(log_dir=val_log_dir)
 
 torch.cuda.empty_cache()
-model = RainPredRNN(input_dim=1, num_hidden=32, num_layers=3, filter_size=3)
+model = RainPredRNN(input_dim=1, num_hidden=128, num_layers=3, filter_size=3)
 model = model.to(DEVICE)
 
 optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
@@ -644,11 +617,11 @@ if __name__ == "__main__":
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                }, os.path.join(CHECKPOINT_DIR, "best_model.pth"))
+                }, os.path.join(CHECKPOINT_DIR, "best_model_6.pth"))
 
             # torch.save(model.state_dict(), os.path.join(CHECKPOINT_DIR, "best_model.pth"))
     
-    state_dict = torch.load(os.path.join(CHECKPOINT_DIR, "best_model.pth"))
+    state_dict = torch.load(os.path.join(CHECKPOINT_DIR, "best_model_6.pth"))
     new_state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
     model.load_state_dict(new_state_dict['model_state_dict'])
     optimizer.load_state_dict(new_state_dict['optimizer_state_dict'])

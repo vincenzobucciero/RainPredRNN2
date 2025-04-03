@@ -9,6 +9,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.cuda.amp import GradScaler, autocast  # Per mixed-precision
 import rasterio
 from rasterio.errors import RasterioIOError
+from rasterio.transform import from_origin
 from skimage.metrics import structural_similarity as ssim
 from sklearn.metrics import confusion_matrix
 from pytorch_msssim import SSIM
@@ -40,6 +41,7 @@ LEARNING_RATE = 0.0001
 NUM_EPOCHS = 100
 INPUT_LENGTH = 6
 PRED_LENGTH = 6
+CROP_DIM = 352
 LAMBDA_DECOUPLE = 0.001
 
 # Normalizzazione delle immagini
@@ -79,8 +81,8 @@ class RadarDataset(Dataset):
         self.files = sorted(glob.glob(os.path.join(data_path, '**/*.tiff'), recursive=True))
         self.is_train = is_train
         self.transform = transforms.Compose([
-            transforms.Resize((448, 448)),
-            # transforms.CenterCrop((448, 448)),
+            # transforms.Resize((448, 448)),
+            transforms.CenterCrop((CROP_DIM, CROP_DIM)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.5], std=[0.5])
         ])
@@ -267,7 +269,7 @@ class TemporalTransformerBlock(nn.Module):
         self.to_feature_map = nn.Sequential(
             nn.Linear(d_model, patch_dim),
             nn.LayerNorm(patch_dim),
-            Rearrange('b (t h w) (p1 p2 c) -> b t c (h p1) (w p2)', t=pred_length, h=7, w=7, p1=patch_size, p2=patch_size), # h e w = 224/2 / patch_size
+            Rearrange('b (t h w) (p1 p2 c) -> b t c (h p1) (w p2)', t=pred_length, h=11, w=11, p1=patch_size, p2=patch_size), # h e w = 224/2 / patch_size
         )
         '''
         self.transformer = nn.Transformer(
@@ -311,40 +313,6 @@ class TemporalTransformerBlock(nn.Module):
         # Ritorna alla forma originale
         out = self.to_feature_map(memory)
         #print('out shape 1', out.shape)
-        return out
-
-    def forward_old(self, input_sequence):
-        # input_sequence: (B, T_in, C, H, W) dove C == d_model
-        B, T, C, H, W = input_sequence.size()
-        # Riorganizza in modo da applicare la Transformer lungo la dimensione temporale per ogni posizione spaziale
-        # Portiamo le dimensioni spaziali all'esterno: (B, H, W, T, C)
-        x = input_sequence.permute(0, 3, 4, 1, 2)  # (B, H, W, T, C)
-        B, H, W, T, C = x.size()
-        N = H * W
-        x = x.reshape(B * N, T, C)  # (B*N, T, C)
-        # Transformer richiede shape (T, batch, C)
-        x = x.transpose(0, 1)  # (T, B*N, C)
-        
-        # Aggiungi positional encoding all'encoder
-        pe_enc = generate_positional_encoding(T, C, x.device)  # (T, 1, C)
-        encoder_input = x + pe_enc
-        
-        # Encoder del Transformer
-        memory = self.transformer.encoder(encoder_input)
-        
-        # # Prepara il decoder con target inizializzati a zero per pred_length passi
-        # tgt = torch.zeros(self.pred_length, B * N, C, device=x.device)
-        # pe_dec = generate_positional_encoding(self.pred_length, C, x.device)  # (pred_length, 1, C)
-        # tgt = tgt + pe_dec
-        
-        # # Decoder del Transformer: predice la sequenza futura
-        # out = self.transformer.decoder(tgt, memory)  # (pred_length, B*N, C)
-        
-        # Ritorna alla forma originale
-        out = memory
-        out = out.transpose(0, 1)  # (B*N, pred_length, C)
-        out = out.reshape(B, H, W, self.pred_length, C)  # (B, H, W, pred_length, C)
-        out = out.permute(0, 3, 4, 1, 2)  # (B, pred_length, C, H, W)
         return out
 
 # === Modello principale: RainPredRNN modificato per usare il Transformer ===
