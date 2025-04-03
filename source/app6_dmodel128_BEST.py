@@ -512,30 +512,52 @@ def save_predictions_old(predictions, output_dir="outputs"):
             filename = os.path.join(output_dir, f"pred_{batch_idx:04d}_t{t+1}.tiff")
             img.save(filename)
 
-def save_predictions(predictions, output_dir="outputs", crs="EPSG:4326", transform=None):
+def save_predictions(predictions, output_dir="outputs", crs=None, transform=None):
+    reference_tiff = "/home/f.demicco/RainPredRNN2/dataset_campania/train/2025/03/23/rdr0_d01_20250323Z0000_VMI_cropped.tiff"
+
+    # Crea la directory di output se non esiste
     os.makedirs(output_dir, exist_ok=True)
+    
+    # Converte le predizioni in un array NumPy
     preds = predictions.detach().cpu().numpy()
-    preds = preds * 0.5 + 0.5 
+    preds = preds * 0.5 + 0.5  # Normalizza le predizioni
     if preds.ndim == 5:
-        preds = preds.squeeze(2) 
+        preds = preds.squeeze(2)  # Rimuove la dimensione temporale se presente
+    
+    # Leggi il file TIFF di riferimento
+    with rasterio.open(reference_tiff) as src:
+        # Calcola la nuova trasformazione georeferenziata dopo il crop
+        crop_size = (352, 352)  # Dimensioni desiderate
+        new_transform = rasterio.windows.transform(
+            rasterio.windows.Window(
+                (src.width - crop_size[1]) // 2,  # X offset per centrare il crop
+                (src.height - crop_size[0]) // 2,  # Y offset per centrare il crop
+                crop_size[1],  # Larghezza del crop
+                crop_size[0]   # Altezza del crop
+            ),
+            src.transform
+        )
+        
+        # Copia il profilo del file di riferimento
+        profile = src.profile
+        
+        # Aggiorna il profilo con le nuove dimensioni e trasformazione
+        profile.update(
+            width=crop_size[1],
+            height=crop_size[0],
+            transform=new_transform,
+            count=1  # Assicurati che il numero di bande sia 1
+        )
+    
+    # Itera su ogni batch e ogni frame temporale
     for batch_idx, seq in enumerate(preds):
         for t in range(seq.shape[0]):
-            frame = (seq[t] * 70.0).clip(0, 255).astype(np.uint8)
-            if transform is None:
-                transform = from_origin(0, frame.shape[0], 1, 1)
+            frame = (seq[t] * 70.0).clip(0, 255).astype(np.uint8)  # Scala e converte il frame
+            
+            # Salva il frame usando il profilo del file di riferimento croppato
             filename = os.path.join(output_dir, f"pred_{batch_idx:04d}_t{t+1}.tiff")
-            with rasterio.open(
-                filename,
-                'w',
-                driver='GTiff',
-                height=frame.shape[0],
-                width=frame.shape[1],
-                count=1,
-                dtype=frame.dtype,
-                crs=crs,  
-                transform=transform,  
-            ) as dst:
-                dst.write(frame, 1) 
+            with rasterio.open(filename, 'w', **profile) as dst:
+                dst.write(frame, 1)  # Scrivi il frame nel file TIFF
 
 def save_predictions_single_test(predictions, output_dir="outputs/custom_test"):
     os.makedirs(output_dir, exist_ok=True)
