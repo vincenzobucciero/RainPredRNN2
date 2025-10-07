@@ -29,13 +29,13 @@ from einops.layers.torch import Rearrange
 def get_device():
     if torch.cuda.device_count() > 1:
         print(f"Using {torch.cuda.device_count()} GPUs!")
-        return torch.device("cuda")
+        return torch.device("cpu") 
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # === Configurazione base ===
 DEVICE = get_device()
-NUM_WORKERS = 8
-BATCH_SIZE = 4
+NUM_WORKERS = 0
+BATCH_SIZE = 2
 LEARNING_RATE = 0.001
 NUM_EPOCHS = 50
 INPUT_LENGTH = 6
@@ -649,7 +649,7 @@ scaler = torch.cuda.amp.GradScaler('cuda', enabled=True)
 
 # === Main ===
 if __name__ == "__main__":
-    DATA_PATH = "/projects/HiWeFAI/dataset"
+    DATA_PATH = os.path.abspath("./dataset_campania")    
     CHECKPOINT_DIR = "checkpoints"
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     
