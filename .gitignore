@@ -177,6 +177,8 @@ cython_debug/
 show_tiffs/
 recupero_tiffs/
 runs/
+test_predictions/
+source/checkpoints/
 source/old/
 source/old2/
 eval/

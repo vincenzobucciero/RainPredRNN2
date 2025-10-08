@@ -17,7 +17,7 @@ import datetime
 import torchio as tio
 import torchvision.transforms as transforms
 import torchvision.ops as vops
-from torch.utils.tensorboard import SummaryWriter
+from torch.utils.tensorboard.writer import SummaryWriter
 import glob
 from functools import partial
 
@@ -34,7 +34,11 @@ def get_device():
 '''
 def get_device():
     return torch.device("cpu")
+<<<<<<< HEAD
 '''
+=======
+
+>>>>>>> 34374ff (comm)
 
 # === Configurazione base ===
 DEVICE = get_device()
@@ -45,6 +49,16 @@ NUM_EPOCHS = 50
 INPUT_LENGTH = 6
 PRED_LENGTH = 6
 LAMBDA_DECOUPLE = 0.001
+'''
+
+DEVICE = "cuda"
+NUM_WORKERS = 8
+BATCH_SIZE = 4       # parti da 16 su 16GB, 32 su 40GB, poi alza
+LEARNING_RATE = 1e-3   # tipico su GPU con Adam/OneCycle
+NUM_EPOCHS = 20
+amp_enabled = True     # torch.cuda.amp autocast+GradScaler
+pin_memory = True  # DataLoader
+PRED_LENGTH = 6
 
 # Normalizzazione delle immagini
 def normalize_image(img):
@@ -653,7 +667,11 @@ scaler = torch.cuda.amp.GradScaler('cuda', enabled=True)
 
 # === Main ===
 if __name__ == "__main__":
+<<<<<<< HEAD
     DATA_PATH = os.path.abspath("/Users/vincenzobucciero/Desktop/RainPredRNN2/dataset_campania")    
+=======
+    DATA_PATH = os.path.abspath("/home/vbucciero/projects/RainPredRNN2/dataset_campania")    
+>>>>>>> 34374ff (comm)
     CHECKPOINT_DIR = "checkpoints"
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     
