@@ -24,13 +24,17 @@ from functools import partial
 from einops import rearrange
 from einops.layers.torch import Rearrange
 
-
 # === Configurazione multi-GPU ===
 def get_device():
     if torch.cuda.device_count() > 1:
         print(f"Using {torch.cuda.device_count()} GPUs!")
-        return torch.device("cpu") 
+        return torch.device("gpu") 
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+'''
+def get_device():
+    return torch.device("cpu")
+'''
 
 # === Configurazione base ===
 DEVICE = get_device()
@@ -649,7 +653,7 @@ scaler = torch.cuda.amp.GradScaler('cuda', enabled=True)
 
 # === Main ===
 if __name__ == "__main__":
-    DATA_PATH = os.path.abspath("./dataset_campania")    
+    DATA_PATH = os.path.abspath("/Users/vincenzobucciero/Desktop/RainPredRNN2/dataset_campania")    
     CHECKPOINT_DIR = "checkpoints"
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     
