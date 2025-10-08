@@ -1,7 +1,4 @@
 
-# Project Title
-
-A brief description of what this project does and who it's for
 
 # RainPredRNN2
 Radar-nowcasting with a U-Net encoder/decoder + temporal Transformer, trained on sequences of TIFF radar frames.
