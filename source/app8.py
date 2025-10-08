@@ -34,12 +34,9 @@ def get_device():
 '''
 def get_device():
     return torch.device("cpu")
-<<<<<<< HEAD
 '''
-=======
 
->>>>>>> 34374ff (comm)
-
+'''
 # === Configurazione base ===
 DEVICE = get_device()
 NUM_WORKERS = 0
