@@ -1,3 +1,8 @@
+
+# Project Title
+
+A brief description of what this project does and who it's for
+
 # RainPredRNN2
 Radar-nowcasting with a U-Net encoder/decoder + temporal Transformer, trained on sequences of TIFF radar frames.
 The model takes INPUT_LENGTH past frames and predicts PRED_LENGTH future frames. It includes data normalization, on-the-fly augmentation, and evaluation metrics (MAE, MSE, SmoothL1, SSIM, CSI).
@@ -11,40 +16,46 @@ The model takes INPUT_LENGTH past frames and predicts PRED_LENGTH future frames.
   - Works on Linux, macOS (CPU/MPS), Windows (CPU/CUDA)
 
 ## 1) Project Structure
-RainPredRNN2/
-├─ source/
-│  ├─ app8.py                # main training/eval script
-│  └─ ...                    # model + dataloaders are defined here
-├─ dataset_campania/
-│  ├─ train/**/*.tiff
-│  ├─ val/**/*.tiff
-│  └─ test/**/*.tiff
-├─ checkpoints/              # created at runtime
-├─ runs/                     # TensorBoard logs (Train/Validation subfolders)
-└─ test_predictions/         # saved predictions (created at runtime)
-Dataset expectation: three splits (train/, val/, test/) containing chronologically ordered .tiff frames.
-The loader scans recursively (**/*.tiff).
-2) Model Overview
-Encoder: U-Net downsampling path (Conv-BN-ReLU + MaxPool).
-Temporal block: Transformer operating on patch embeddings across time.
-Decoder: U-Net upsampling path with skip connections.
-Normalization: radar values clipped to [0,70] dBZ → scaled to [0,1].
-Augmentation (train only): flips + random affine (via torchio).
-Metrics: MAE, MSE, SmoothL1, SSIM, CSI (threshold in dBZ).
-Logging: per-epoch train loss + val metrics to TensorBoard.
-Outputs: predicted frames written to test_predictions/… as .tiff.
-3) Requirements
-Recommended: use Conda (conda-forge) for GDAL/rasterio stability.
-Core Python deps (Python 3.10–3.12):
-torch, torchvision, numpy, scikit-image
-scikit-learn, pytorch-msssim, einops
-rasterio (depends on GDAL)
-Pillow, tensorboard, torchio
-3.1 Quick install (Conda – works on Linux/macOS/Windows)
-# Create env
-conda create -n rainpredrnn2 python=3.11 -y
-conda activate rainpredrnn2
+| Path | Purpose |
+|---|---|
+| `source/app8.py` | Main training & evaluation script |
+| `source/…` | Model, dataloaders, utils |
+| `dataset_campania/train/**/*.tiff` | Training radar frames (TIFF) |
+| `dataset_campania/val/**/*.tiff` | Validation frames |
+| `dataset_campania/test/**/*.tiff` | Test frames |
+| `checkpoints/` | Saved models (created at runtime)
+| `runs/Train`, `runs/Validation` | TensorBoard logs |
+| `test_predictions/` | Saved predictions (created at runtime) |
 
+Dataset expectation: three splits (train/, val/, test/) containing chronologically ordered **.tiff** frames.
+The loader scans recursively (**/*.tiff).
+
+## 2) Model Overview
+- **Encoder**: U-Net downsampling path (Conv-BN-ReLU + MaxPool).
+- **Temporal block**: Transformer operating on patch embeddings across time.
+- **Decoder**: U-Net upsampling path with skip connections.
+- **Normalization**: radar values clipped to [0,70] dBZ → scaled to [0,1].
+- **Augmentation (train only)**: flips + random affine (via torchio).
+- **Metrics**: MAE, MSE, SmoothL1, SSIM, CSI (threshold in dBZ).
+- **Logging**: per-epoch train loss + val metrics to TensorBoard.
+- **Outputs**: predicted frames written to test_predictions/… as .tiff.
+
+## 3) Requirements
+    > Recommended: use Conda (conda-forge) for GDAL/rasterio stability.
+### Core Python deps (Python 3.10–3.12)**:
+- *torch, torchvision, numpy, scikit-image*
+- *scikit-learn, pytorch-msssim, einops*
+- *rasterio (depends on GDAL)*
+- *Pillow, tensorboard, torchio*
+- 3.1 Quick install (Conda – works on Linux/macOS/Windows)
+
+### Create env
+```
+conda create -n rainpredrnn2 python=3.11 -y
+```
+```
+conda activate rainpredrnn2
+```
 # Install PyTorch
 # Linux/Windows CUDA (choose version from pytorch.org if needed)
 # CPU-only: replace with "pytorch torchvision cpuonly -c pytorch"
