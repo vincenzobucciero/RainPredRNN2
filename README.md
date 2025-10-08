@@ -9,7 +9,8 @@ The model takes INPUT_LENGTH past frames and predicts PRED_LENGTH future frames.
   - TensorBoard logging
   - Mixed precision (AMP) on CUDA, optional gradient accumulation (easy to enable)
   - Works on Linux, macOS (CPU/MPS), Windows (CPU/CUDA)
-1) Project Structure
+
+## 1) Project Structure
 RainPredRNN2/
 ├─ source/
 │  ├─ app8.py                # main training/eval script
