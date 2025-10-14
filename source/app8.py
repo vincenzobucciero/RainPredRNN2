@@ -665,7 +665,7 @@ scaler = torch.cuda.amp.GradScaler('cuda', enabled=True)
 # === Main ===
 if __name__ == "__main__":
     # DATA_PATH = os.path.abspath("/Users/vincenzobucciero/Desktop/RainPredRNN2/dataset_campania")    
-    DATA_PATH = os.path.abspath("/home/vbucciero/projects/RainPredRNN2/dataset_campania")    
+    DATA_PATH = os.path.abspath("/storage/external/hiwefai/data/")    
     CHECKPOINT_DIR = "checkpoints"
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     
