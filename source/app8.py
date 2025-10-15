@@ -2,6 +2,7 @@ import os
 import math
 import glob
 import datetime
+import time
 import numpy as np
 from functools import partial
 from PIL import Image
@@ -35,9 +36,10 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 NUM_WORKERS = 8
 BATCH_SIZE = 4
 LEARNING_RATE = 1e-3
-NUM_EPOCHS = 20
+NUM_EPOCHS = 1
 PRED_LENGTH = 6
 pin_memory = True
+USE_AMP = True  # mixed precision su GPU moderne
 
 # ===============================
 # Utils / Seed
@@ -63,15 +65,27 @@ def get_augmentation_transforms():
         tio.RandomAffine(scales=(0.8, 1.2), degrees=90, p=0.5),
     ])
 
+def tiff_is_readable_quick(path):
+    """Check veloce: prova a leggere UNA riga dalla banda 1."""
+    try:
+        with rasterio.open(path) as src:
+            _ = src.read(1, window=((0, 1), (0, src.width)))
+        return True
+    except Exception:
+        return False
+
+
 # ===============================
 # Dataset
 # ===============================
 class RadarDataset(Dataset):
-    def __init__(self, data_path, input_length=6, pred_length=6, is_train=True,
-                 generate_mask=True, return_paths=False):
+    def __init__(self, data_path, input_length=18, pred_length=6, is_train=True,
+                 generate_mask=True, return_paths=False, min_size=1024):
         self.input_length = input_length
         self.pred_length = pred_length
         self.seq_length = input_length + pred_length
+        self.min_size = min_size
+
         # .tif + .tiff
         self.files = []
         self.files += glob.glob(os.path.join(data_path, '**/*.tif'), recursive=True)
@@ -94,18 +108,23 @@ class RadarDataset(Dataset):
         self.total_possible_windows = max(0, len(self.files) - self.seq_length + 1)
         self.augmentation_transforms = get_augmentation_transforms() if is_train else None
 
-        # pre-screen finestre valide
+        # prescreen finestre valide - read-based (leggi solo una riga)
         for start_idx in range(self.total_possible_windows):
             ok = True
             for i in range(self.seq_length):
                 f = self.files[start_idx + i]
                 if f not in self.file_validity:
                     try:
-                        with rasterio.open(f) as src:
-                            valid = src.count > 0
-                    except RasterioIOError:
+                        size = os.path.getsize(f)
+                    except FileNotFoundError:
+                        size = 0
+                    if size < self.min_size:
                         valid = False
-                        print(f"File non valido: {f}")
+                    else:
+                        valid = tiff_is_readable_quick(f)
+                        if not valid:
+                            # log minimale per capire quali file saltano
+                            print(f"File non valido (read fail): {f}")
                     self.file_validity[f] = valid
                 if not self.file_validity[f]:
                     ok = False
@@ -133,40 +152,71 @@ class RadarDataset(Dataset):
         return len(self.valid_indices)
 
     def __getitem__(self, idx):
-        start = self.valid_indices[idx]
-        images = []
-        target_frame_paths = []
+        # retry/skip guardrail per file corrotti incontrati a runtime
+        max_resamples = 8
+        attempts = 0
+        base_idx = idx
 
-        for i in range(self.seq_length):
-            f = self.files[start + i]
-            with rasterio.open(f) as src:
-                img = src.read(1).astype(np.float32)
-            img = normalize_image(img)
-            img = Image.fromarray(img)
-            img = self.transform(img)
-            images.append(img)
-            if i >= self.input_length:
-                target_frame_paths.append(f)
+        while attempts < max_resamples:
+            start = self.valid_indices[idx]
+            images = []
+            target_frame_paths = []
+            failed = False
 
-        all_frames = torch.stack(images)                  # (seq, C, H, W)
-        all_frames = all_frames.permute(1, 0, 2, 3)       # (C, seq, H, W)
+            for i in range(self.seq_length):
+                f = self.files[start + i]
+                try:
+                    with rasterio.open(f) as src:
+                        img = src.read(1).astype(np.float32)
+                except Exception as e:
+                    # marchia non valido e resample indice
+                    self.file_validity[f] = False
+                    failed = True
+                    # resample rapido: randomizza in train, sequenziale in val
+                    if self.is_train:
+                        idx = (idx + np.random.randint(1, 64)) % len(self.valid_indices)
+                    else:
+                        idx = (idx + 1) % len(self.valid_indices)
+                    attempts += 1
+                    break
 
-        if self.is_train and self.augmentation_transforms is not None:
-            all_frames = self.augmentation_transforms(all_frames)
+                img = normalize_image(img)
+                # pipeline PIL + torchvision (semplice e sicura)
+                img = Image.fromarray((img * 255.0).astype(np.uint8))
+                img = self.transform(img)
+                images.append(img)
+                if i >= self.input_length:
+                    target_frame_paths.append(f)
 
-        inputs  = all_frames[:, :self.input_length]       # (C, Tin, H, W)
-        targets = all_frames[:, self.input_length:]       # (C, Tout, H, W)
+            if failed:
+                continue
 
-        inputs  = inputs.permute(1, 0, 2, 3)              # (Tin, C, H, W)
-        targets = targets.permute(1, 0, 2, 3)             # (Tout, C, H, W)
+            # stack e augmentations
+            all_frames = torch.stack(images)                  # (seq, C, H, W)
+            all_frames = all_frames.permute(1, 0, 2, 3)       # (C, seq, H, W)
 
-        mask = None
-        if self.generate_mask:
-            mask = torch.where(targets > -1.0, 1.0, 0.0)
+            if self.is_train and self.augmentation_transforms is not None:
+                all_frames = self.augmentation_transforms(all_frames)
 
-        if self.return_paths:
-            return inputs, targets, mask, target_frame_paths
-        return inputs, targets, mask
+            if not isinstance(all_frames, torch.Tensor):
+                all_frames = torch.as_tensor(all_frames)
+
+            inputs  = all_frames[:, :self.input_length]       # (C, Tin, H, W)
+            targets = all_frames[:, self.input_length:]       # (C, Tout, H, W)
+
+            inputs  = inputs.permute(1, 0, 2, 3)              # (Tin, C, H, W)
+            targets = targets.permute(1, 0, 2, 3)             # (Tout, C, H, W)
+
+            mask = None
+            if self.generate_mask:
+                mask = torch.where(targets > -1.0, 1.0, 0.0)
+
+            if self.return_paths:
+                return inputs, targets, mask, target_frame_paths
+            return inputs, targets, mask
+
+        # se proprio non riusciamo dopo N tentativi
+        raise RasterioIOError(f"Nessuna finestra valida dopo {max_resamples} tentativi; indice iniziale {base_idx}.")
 
 # ===============================
 # Modello (encoder/decoder + “trasformer” temporale)
@@ -236,14 +286,29 @@ class TemporalTransformerBlock(nn.Module):
         H, W = x.shape[-2:]
         ph = H // self.patch_height
         pw = W // self.patch_width
-        x = self.to_patch_embedding(x)         # (B, Tin*ph*pw, d)
+
+        # 1) embedding a token per patch-tempo
+        x = self.to_patch_embedding(x)  # (B, Tin*ph*pw, d)
         B, T, D = x.shape
+
+        # 2) positional encoding + encoder
         pe = generate_positional_encoding(T, D, x.device)
-        mem = self.encoder(x + pe)
-        out = self.to_feature_map(mem)
-        # rimappa a (B, Tout, C, H, W) — qui usiamo pred_length token “finali”
-        out = rearrange(out, 'b (t h w) (p1 p2 c) -> b t c (h p1) (w p2)',
-                        t=self.pred_length, h=ph, w=pw, p1=self.patch_height, p2=self.patch_width)
+        mem = self.encoder(x + pe)  # (B, Tin*ph*pw, d)
+
+        # 3) prendi SOLO gli ultimi pred_length*ph*pw token
+        tokens_per_frame = ph * pw
+        needed = self.pred_length * tokens_per_frame
+        assert needed <= T, f"pred_length ({self.pred_length}) * ph*pw ({tokens_per_frame}) > Tin*ph*pw ({T})"
+        mem = mem[:, -needed:, :]  # (B, pred_length*ph*pw, d)
+
+        # 4) proietta e rimappa a feature map
+        out = self.to_feature_map(mem)  # (B, pred_length*ph*pw, p1*p2*C)
+        out = rearrange(
+            out,
+            'b (t h w) (p1 p2 c) -> b t c (h p1) (w p2)',
+            t=self.pred_length, h=ph, w=pw,
+            p1=self.patch_height, p2=self.patch_width
+        )  # (B, Tout, C, H, W)
         return out
 
 class RainPredRNN(nn.Module):
@@ -268,7 +333,7 @@ class RainPredRNN(nn.Module):
         pred_feats = self.transformer_block(enc_feats)   # (B, Tout, Cenc, H/2, W/2)
 
         preds, preds_noact = [], []
-        # ATT: qui usiamo i salti frame-per-frame; valido finché pred_length <= Tin
+        # ATT: valido finché pred_length <= Tin
         for t in range(pred_length):
             y, y_no = self.decoder(pred_feats[:, t], enc_feats[:, t], skip1[:, t])
             preds.append(y); preds_noact.append(y_no)
@@ -281,11 +346,115 @@ def create_dataloaders(data_path, batch_size=4, num_workers=4):
     train_dataset = RadarDataset(os.path.join(data_path, 'train'), is_train=True)
     val_dataset   = RadarDataset(os.path.join(data_path, 'val'),   is_train=False, return_paths=True)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
-                              num_workers=num_workers, pin_memory=True, drop_last=True)
-    val_loader   = DataLoader(val_dataset, batch_size=1, shuffle=False,
-                              num_workers=num_workers, pin_memory=True)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=True,
+        persistent_workers=True,
+        prefetch_factor=4
+    )
+    val_loader   = DataLoader(
+        val_dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=4
+    )
     return train_loader, val_loader
+
+# ===== Benchmark =====
+def _hms(sec: float):
+    sec = int(sec)
+    h = sec // 3600
+    m = (sec % 3600) // 60
+    s = sec % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+def benchmark_train(loader, model, optimizer, device, scaler=None, warmup=2, measure=10):
+    """Misura batch/s includendo forward+loss+backward+step (train)."""
+    model.train()
+    it = iter(loader)
+    # warmup
+    for _ in range(warmup):
+        batch = next(it)
+        inputs, targets, mask = batch[:3]
+        inputs = inputs.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+        mask = mask.to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
+        if scaler is not None:
+            with torch.cuda.amp.autocast():
+                outputs, logits = model(inputs, PRED_LENGTH)
+                loss = criterion_sl1(outputs, targets) * criterion_mae_lambda + criterion_fl(logits, mask) * criterion_mae_lambda
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            outputs, logits = model(inputs, PRED_LENGTH)
+            loss = criterion_sl1(outputs, targets) * criterion_mae_lambda + criterion_fl(logits, mask) * criterion_mae_lambda
+            loss.backward()
+            optimizer.step()
+
+    if torch.cuda.is_available(): torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    counted = 0
+    for _ in range(measure):
+        try:
+            batch = next(it)
+        except StopIteration:
+            break
+        inputs, targets, mask = batch[:3]
+        inputs = inputs.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+        mask = mask.to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
+        if scaler is not None:
+            with torch.cuda.amp.autocast():
+                outputs, logits = model(inputs, PRED_LENGTH)
+                loss = criterion_sl1(outputs, targets) * criterion_mae_lambda + criterion_fl(logits, mask) * criterion_mae_lambda
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            outputs, logits = model(inputs, PRED_LENGTH)
+            loss = criterion_sl1(outputs, targets) * criterion_mae_lambda + criterion_fl(logits, mask) * criterion_mae_lambda
+            loss.backward()
+            optimizer.step()
+        counted += 1
+    if torch.cuda.is_available(): torch.cuda.synchronize()
+    dt = time.perf_counter() - t0
+    return counted / dt if dt > 0 else 0.0
+
+def benchmark_val(loader, model, device, warmup=2, measure=20):
+    """Misura batch/s della sola forward (validation)."""
+    model.eval()
+    it = iter(loader)
+    with torch.no_grad():
+        for _ in range(warmup):
+            batch = next(it)
+            inputs = batch[0].to(device, non_blocking=True)
+            _ = model(inputs, PRED_LENGTH)
+        if torch.cuda.is_available(): torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        counted = 0
+        for _ in range(measure):
+            try:
+                batch = next(it)
+            except StopIteration:
+                break
+            inputs = batch[0].to(device, non_blocking=True)
+            _ = model(inputs, PRED_LENGTH)
+            counted += 1
+        if torch.cuda.is_available(): torch.cuda.synchronize()
+    dt = time.perf_counter() - t0
+    return counted / dt if dt > 0 else 0.0
+# ===== Fine benchmark =====
+
 
 # ===============================
 # Metriche & Train/Eval
@@ -335,36 +504,54 @@ def calculate_metrics(preds, targets, logits=None, mask=None, threshold_dbz=15):
 
     return {'TOTAL': total, 'SmoothL1': sl1, 'MAE': mae, 'FL': fl, 'SSIM': ssim_val, 'CSI': csi}
 
-def train_epoch(model, loader, optimizer, device):
+def train_epoch(model, loader, optimizer, device, scaler=None):
     model.train()
     total_loss = 0.0
     for inputs, targets, mask in loader:
-        inputs, targets, mask = inputs.to(device), targets.to(device), mask.to(device)
-        optimizer.zero_grad()
-        outputs, logits = model(inputs, PRED_LENGTH)
-        loss = criterion_sl1(outputs, targets) * criterion_mae_lambda
-        loss += criterion_fl(logits, mask) * criterion_mae_lambda
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item()
-    return total_loss / len(loader)
+        inputs = inputs.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+        mask = mask.to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
+
+        if scaler is not None:
+            with torch.cuda.amp.autocast():
+                outputs, logits = model(inputs, PRED_LENGTH)
+                loss = criterion_sl1(outputs, targets) * criterion_mae_lambda
+                loss += criterion_fl(logits, mask) * criterion_mae_lambda
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            outputs, logits = model(inputs, PRED_LENGTH)
+            loss = criterion_sl1(outputs, targets) * criterion_mae_lambda
+            loss += criterion_fl(logits, mask) * criterion_mae_lambda
+            loss.backward()
+            optimizer.step()
+
+        total_loss += float(loss.detach().cpu())
+    
+    return total_loss / max(1, len(loader))
 
 def evaluate(model, loader, device):
     model.eval()
-    agg = {'MAE':0,'SSIM':0,'CSI':0,'SmoothL1':0,'FL':0,'TOTAL':0}
+    agg = {'MAE':0.0,'SSIM':0.0,'CSI':0.0,'SmoothL1':0.0,'FL':0.0,'TOTAL':0.0}
     with torch.no_grad():
         for batch in loader:
             if len(batch) == 4:
                 inputs, targets, mask, _ = batch
             else:
                 inputs, targets, mask = batch
-            inputs, targets, mask = inputs.to(device), targets.to(device), mask.to(device)
+            inputs = inputs.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
+            mask = mask.to(device, non_blocking=True)
             outputs, logits = model(inputs, PRED_LENGTH)
             m = calculate_metrics(outputs, targets, logits, mask)
-            for k in agg: agg[k] += m[k]
-    for k in agg: agg[k] /= len(loader)
+            for k in agg: agg[k] += float(m[k])
+    for k in agg: agg[k] /= float(max(1, len(loader)))
     torch.cuda.empty_cache()
     return agg
+
+
 
 # ===============================
 # Salvataggi preview dalla VAL
@@ -384,16 +571,27 @@ def save_predictions_paired(predictions, targets, target_paths, base_out):
     if targs.ndim == 5: targs = targs.squeeze(2)
 
     T = preds.shape[1]
-    if target_paths is None:
-        # se non abbiamo i path, usa indici
+
+    # --- squeeze lista annidata se serve
+    if isinstance(target_paths, (list, tuple)) and target_paths and isinstance(target_paths[0], (list, tuple)):
+        target_paths = target_paths[0]
+
+    # genera nomi se mancano, oppure allinea lunghezze
+    if not target_paths:
         target_paths = [f"frame_{i:02d}.tiff" for i in range(T)]
+    else:
+        if len(target_paths) < T:
+            target_paths = list(target_paths) + [f"frame_{i:02d}.tiff" for i in range(len(target_paths), T)]
+        elif len(target_paths) > T:
+            target_paths = list(target_paths)[:T]
 
     for t in range(T):
         stem = os.path.splitext(os.path.basename(target_paths[t]))[0]
-        frame_p = (preds[0, t] * 255.0).clip(0,255).astype(np.uint8)
-        frame_t = (targs[0, t] * 255.0).clip(0,255).astype(np.uint8)
+        frame_p = (preds[0, t] * 255.0).clip(0, 255).astype(np.uint8)
+        frame_t = (targs[0, t] * 255.0).clip(0, 255).astype(np.uint8)
         Image.fromarray(frame_p).save(os.path.join(out_pred, f"{stem}_pred.tiff"))
         Image.fromarray(frame_t).save(os.path.join(out_targ, f"{stem}_target.tiff"))
+
 
 def save_val_previews(model, val_loader, device, out_root, epoch, max_batches=2):
     model.eval()
@@ -402,22 +600,26 @@ def save_val_previews(model, val_loader, device, out_root, epoch, max_batches=2)
     with torch.no_grad():
         for i, batch in enumerate(val_loader):
             if i >= max_batches: break
-            # val_loader restituisce (inputs, targets, mask, paths)
             if len(batch) == 4:
                 inputs, targets, mask, paths = batch
+                # --- squeeze per batch_size=1: [[...]] -> [...]
+                if isinstance(paths, (list, tuple)) and paths and isinstance(paths[0], (list, tuple)):
+                    paths = paths[0]
             else:
                 inputs, targets, mask = batch
                 paths = None
-            inputs, targets = inputs.to(device), targets.to(device)
+            inputs = inputs.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
             outputs, _ = model(inputs, PRED_LENGTH)
             save_predictions_paired(outputs, targets, paths, base_out=ep_dir)
+
 
 # ===============================
 # MAIN
 # ===============================
 if __name__ == "__main__":
     # Path degli split “clean” (train/val)
-    DATA_PATH = os.path.abspath("/storage/external_01/hiwefai/data/rdr0_splits_clean/")
+    DATA_PATH = os.path.abspath("/storage/external_01/hiwefi/data/rdr0_5k_splits")
 
     # logging & writers
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -431,12 +633,27 @@ if __name__ == "__main__":
                         patch_height=16, patch_width=16).to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5)
+    scaler = torch.cuda.amp.GradScaler(enabled=(USE_AMP and DEVICE == "cuda"))
 
     # data
     train_loader, val_loader = create_dataloaders(DATA_PATH, BATCH_SIZE, NUM_WORKERS)
 
+    # Stima tempi
+    steps_train = len(train_loader)
+    steps_val = len(val_loader)
+
+    bps_train = benchmark_train(train_loader, model, optimizer, DEVICE, scaler=scaler, warmup=2, measure=10)
+    bps_val   = benchmark_val(val_loader, model, DEVICE, warmup=2, measure=50)
+
+    eta_train = steps_train / bps_train if bps_train > 0 else float('inf')
+    eta_val   = steps_val   / bps_val   if bps_val   > 0 else float('inf')
+
+    print(f"[Benchmark] Train: ~{bps_train:.2f} batch/s | steps/epoch={steps_train} | ETA epoca ≈ {_hms(eta_train)}")
+    print(f"[Benchmark] Val  : ~{bps_val:.2f} batch/s | steps/val  ={steps_val}   | ETA val   ≈ {_hms(eta_val)}")
+
+
     # dove salvo le anteprime dalla validation ad ogni epoca
-    VAL_PREVIEW_ROOT = "/storage/external_01/hiwefai/data/RDR0_val_previews"
+    VAL_PREVIEW_ROOT = "/storage/external_01/hiwefi/data/rdr0_val_previews"
     os.makedirs(VAL_PREVIEW_ROOT, exist_ok=True)
 
     best_val = float('inf')
@@ -444,7 +661,7 @@ if __name__ == "__main__":
 
     for epoch in range(NUM_EPOCHS):
         print(f"Epoch {epoch+1}/{NUM_EPOCHS}")
-        train_loss = train_epoch(model, train_loader, optimizer, DEVICE)
+        train_loss = train_epoch(model, train_loader, optimizer, DEVICE, scaler=scaler)
         val_metrics = evaluate(model, val_loader, DEVICE)
         scheduler.step(val_metrics['TOTAL'])
 
