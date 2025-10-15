@@ -96,7 +96,7 @@ def criterion_fl_from_normalized(preds, targets, mean=0.5, std=0.5):
 
 
 class RadarDataset(Dataset):
-    def __init__(self, data_path, input_length=6, pred_length=6, is_train=True, generate_mask=True):
+    def __init__(self, data_path, input_length=6, pred_length=6, is_train=True, generate_mask=True, return_paths=False):
         self.input_length = input_length
         self.pred_length = pred_length
         self.seq_length = input_length + pred_length
@@ -150,12 +150,16 @@ class RadarDataset(Dataset):
         #print(f"6. Indici validi: {self.valid_indices}")
         print(" ===================================================== \n")
 
+        self.return_paths = return_paths
+
     def __len__(self):
         return len(self.valid_indices)
 
     def __getitem__(self, idx):
         start = self.valid_indices[idx]
         images = []
+        target_frame_paths = []
+
         for i in range(self.seq_length):
             file = self.files[start + i]
             with rasterio.open(file) as src:
@@ -164,6 +168,10 @@ class RadarDataset(Dataset):
                 img = Image.fromarray(img)
                 img = self.transform(img)
                 images.append(img)
+
+            if i >= self.input_length:
+                target_frame_paths.append(file)
+        
         all_frames = torch.stack(images)  # Shape: (seq_length, C, H, W) -> (12, 1, 200, 200)
         
         # Riordina le dimensioni: da (seq_length, C, H, W) a (C, seq_length, H, W)
@@ -179,9 +187,12 @@ class RadarDataset(Dataset):
         targets = targets.permute(1, 0, 2, 3)  # Shape: (6, 1, 200, 200)
         
         mask = None
+
         if self.generate_mask:
             mask = torch.where(targets > -1.0, 1.0, 0.0)
         
+        if self.return_paths:
+            return inputs, targets, mask, target_frame_paths
         return inputs, targets, mask
 
 # === UNet Encoder e Decoder (invariati) ===
@@ -476,7 +487,7 @@ class RainPredRNN(nn.Module):
 def create_dataloaders(data_path, batch_size=4, num_workers=4):
     train_dataset = RadarDataset(os.path.join(data_path, 'train'), is_train=True)
     val_dataset = RadarDataset(os.path.join(data_path, 'val'), is_train=False)
-    test_dataset = RadarDataset(os.path.join(data_path, 'test'), is_train=False)
+    test_dataset = RadarDataset(os.path.join(data_path, 'test'), is_train=False, return_paths=True)
     
     train_loader = DataLoader(
         train_dataset,
@@ -632,6 +643,44 @@ def save_predictions_single_test(predictions, output_dir="outputs/custom_test"):
         filename = os.path.join(output_dir, f"pred_t{t+1}.tiff")
         img.save(filename)
 
+def save_predictions_paired(predictions, targets, target_paths, base_out):
+    """
+    Salva per ogni sequenza di test:
+      - le immagini predette
+      - i target corrispondenti
+    usando lo stesso 'stem' del file bersaglio.
+    """
+    os.makedirs(base_out, exist_ok=True)
+    out_pred = os.path.join(base_out, "predictions")
+    out_targ = os.path.join(base_out, "targets")
+    os.makedirs(out_pred, exist_ok=True)
+    os.makedirs(out_targ, exist_ok=True)
+
+    # Tensor -> numpy [0..1]
+    preds = predictions.detach().cpu().numpy()
+    targs = targets.detach().cpu().numpy()
+    preds = preds * 0.5 + 0.5
+    targs = targs * 0.5 + 0.5
+
+    # squeeze eventuale canale
+    if preds.ndim == 5: preds = preds.squeeze(2)   # (B, T, H, W)
+    if targs.ndim == 5: targs = targs.squeeze(2)
+
+    # Aspettiamo batch size 1 nel test_loader
+    # preds.shape = (1, T, H, W), targs.shape = (1, T, H, W)
+    seq_len = preds.shape[1]
+    assert seq_len == len(target_paths), "Mismatch tra #frame target e paths"
+
+    for t in range(seq_len):
+        stem = os.path.splitext(os.path.basename(target_paths[t]))[0]
+        # Pred
+        frame_p = (preds[0, t] * 255.0).clip(0, 255).astype(np.uint8)
+        Image.fromarray(frame_p).save(os.path.join(out_pred, f"{stem}_pred.tiff"))
+        # Target
+        frame_t = (targs[0, t] * 255.0).clip(0, 255).astype(np.uint8)
+        Image.fromarray(frame_t).save(os.path.join(out_targ, f"{stem}_target.tiff"))
+
+
 # === Inizializzazione modello ===
 timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 log_dir = os.path.join("runs/", timestamp)
@@ -665,7 +714,7 @@ scaler = torch.cuda.amp.GradScaler('cuda', enabled=True)
 # === Main ===
 if __name__ == "__main__":
     # DATA_PATH = os.path.abspath("/Users/vincenzobucciero/Desktop/RainPredRNN2/dataset_campania")    
-    DATA_PATH = os.path.abspath("/storage/external/hiwefai/data/")    
+    DATA_PATH = os.path.abspath("/storage/external_01/hiwefi/data/rdr0_splits")    
     CHECKPOINT_DIR = "checkpoints"
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     
@@ -732,11 +781,22 @@ if __name__ == "__main__":
         # writer.add_images("Output-Sequence", outputs[0]) 
         # save_predictions(outputs, "/home/f.demicco/RainPredRNN2/test_predictions/batch_0000")
 
-        for i, (inputs, targets, mask) in enumerate(test_loader):
-            inputs = inputs.to(DEVICE)
+        OUT_ROOT = "/storage/external_01/hiwefi/data/RDR0_eval"  # cartella di lavoro su disco remoto
+        run_stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        OUT_DIR = os.path.join(OUT_ROOT, f"test_{run_stamp}")
+        os.makedirs(OUT_DIR, exist_ok=True)
+
+        for i, batch in enumerate(test_loader):
+            # batch = (inputs, targets, mask, target_paths) perché return_paths=True
+            inputs, targets, mask, target_paths = batch
+            inputs  = inputs.to(DEVICE)
+            targets = targets.to(DEVICE)
+
             outputs, _ = model(inputs, PRED_LENGTH)
-            save_predictions(outputs, f"test_predictions/batch_{i:04d}")
-            save_predictions(targets, f"test_predictions/batch_real_{i:04d}")
-    print("Predizioni salvate correttamente")
+            # salva in OUT_DIR/predictions e OUT_DIR/targets con lo stesso stem dei file target
+            save_predictions_paired(outputs, targets, target_paths, base_out=OUT_DIR)
+
+        print(f"Predizioni e target salvati in: {OUT_DIR}")
+
     train_writer.close()
     val_writer.close()
