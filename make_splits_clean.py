@@ -4,7 +4,7 @@ import os, glob, math, shutil
 ROOT = "/storage/external_01/hiwefi/data"
 DATA_DIR = os.path.join(ROOT, "rdr0_3k")
 OUT_DIR  = os.path.join(ROOT, "rdr0_3k_splits_clean")
-os.makedirs(OUT_DIR, exist_ok=True)
+os.makedirs(OUT_DIR, exist_ok=True) 
 
 # raccogli file robustamente
 def gather_images(root):
