@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=rainpred_train
-#SBATCH --partition=gpu              # partizione GPU, nessun --gres
+#SBATCH --partition=xgpu              # partizione GPU, nessun --gres
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
