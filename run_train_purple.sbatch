@@ -20,7 +20,7 @@
 module load cuda/12.2 2>/dev/null || true
 
 # Attiva l'ambiente virtuale
-source /home/vbucciero/projects/RainPredRNN2/venv/bin/activate
+source /home/vbucciero/projects/RainPredRNN2/venv3-11/bin/activate
 
 # Ottimizza allocazione VRAM per PyTorch
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -37,7 +37,7 @@ echo "================"
 cd /home/vbucciero/projects/RainPredRNN2/source
 
 # Esegui il training
-python3 -u app9.py
+python3 app9.py
 
 # --------------------------------------------------------------------
 # Fine job
