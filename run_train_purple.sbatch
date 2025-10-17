@@ -19,7 +19,7 @@ echo "================"
 
 cd /home/v.bucciero/projects/hiwefi/RainPredRNN2/source
 
-python-u app9.py
+python -u app9.py
 
 # --------------------------------------------------------------------
 # Fine job
