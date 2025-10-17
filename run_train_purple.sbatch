@@ -35,7 +35,7 @@ echo "================"
 cd /home/vbucciero/projects/RainPredRNN2/source
 
 # Esegui il training
-python app9.py
+python3 -u app9.py
 
 # --------------------------------------------------------------------
 # Fine job
