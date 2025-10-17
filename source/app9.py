@@ -698,7 +698,7 @@ def save_all_val_targets(val_loader, out_root, epoch, overwrite=False):
 # ===============================
 if __name__ == "__main__":
     # Path degli split “clean” (train/val)
-    DATA_PATH = os.path.abspath("/home/v.bucciero/data/instruments/rdr0")
+    DATA_PATH = os.path.abspath("/home/v.bucciero/data/instruments/rdr0/rdr0_splits")
 
     # logging & writers
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
