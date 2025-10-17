@@ -698,7 +698,7 @@ def save_all_val_targets(val_loader, out_root, epoch, overwrite=False):
 # ===============================
 if __name__ == "__main__":
     # Path degli split “clean” (train/val)
-    DATA_PATH = os.path.abspath("/storage/external_01/hiwefi/data/rdr0_5k_splits")
+    DATA_PATH = os.path.abspath("/home/v.bucciero/data/instruments/rdr0")
 
     # logging & writers
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -731,7 +731,7 @@ if __name__ == "__main__":
     print(f"[Benchmark] Val  : ~{bps_val:.2f} batch/s | steps/val  ={steps_val}   | ETA val   ≈ {_hms(eta_val)}")
 
     # dove salvo le anteprime dalla validation ad ogni epoca
-    VAL_PREVIEW_ROOT = "/storage/external_01/hiwefi/data/rdr0_val_previews"
+    VAL_PREVIEW_ROOT = "/home/v.bucciero/data/instruments/rdr0_previews"
     os.makedirs(VAL_PREVIEW_ROOT, exist_ok=True)
 
     best_val = float('inf')
