@@ -36,7 +36,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 NUM_WORKERS = 8
 BATCH_SIZE = 4
 LEARNING_RATE = 1e-3
-NUM_EPOCHS = 10
+NUM_EPOCHS = 1
 PRED_LENGTH = 6
 pin_memory = True
 USE_AMP = True  # mixed precision su GPU moderne
@@ -556,6 +556,7 @@ def evaluate(model, loader, device):
 # ===============================
 # Salvataggi preview dalla VAL
 # ===============================
+'''
 def save_predictions_paired(predictions, targets, target_paths, base_out):
     os.makedirs(base_out, exist_ok=True)
     out_pred = os.path.join(base_out, "predictions")
@@ -612,7 +613,110 @@ def save_val_previews(model, val_loader, device, out_root, epoch, max_batches=2)
             targets = targets.to(device, non_blocking=True)
             outputs, _ = model(inputs, PRED_LENGTH)
             save_predictions_paired(outputs, targets, paths, base_out=ep_dir)
+'''
+def save_all_val_predictions(model, val_loader, device, out_root, epoch,
+                             overwrite=False):
+    """
+    Esegue la forward su TUTTA la validation e salva una sola prediction
+    per ciascun TIFF target, usando SEMPRE il nome reale (da target_paths).
+    Non usa nomi sintetici. Se i path non ci sono, solleva errore.
+    """
+    model.eval()
+    ep_dir = os.path.join(out_root, f"epoch_{epoch:03d}")
+    out_pred = os.path.join(ep_dir, "predictions")
+    os.makedirs(out_pred, exist_ok=True)
 
+    # set per evitare duplicati dovuti a finestre sovrapposte
+    saved = set()
+
+    with torch.no_grad():
+        for batch in val_loader:
+            # Val loader deve avere return_paths=True (già così nel tuo create_dataloaders)
+            if len(batch) != 4:
+                raise RuntimeError("Validation loader deve restituire (inputs, targets, mask, paths).")
+
+            inputs, targets, mask, paths = batch
+
+            # squeeze per batch_size=1: [[...]] -> [...]
+            if isinstance(paths, (list, tuple)) and paths and isinstance(paths[0], (list, tuple)):
+                paths = paths[0]
+
+            if not paths or len(paths) == 0:
+                raise RuntimeError("Mancano i target_paths nella validation: disabilitato il fallback frame_XX.")
+
+            inputs  = inputs.to(device, non_blocking=True)
+            outputs, _ = model(inputs, PRED_LENGTH)  # (1, T, 1, H, W)
+
+            preds = outputs.detach().cpu().numpy()
+            preds = preds * 0.5 + 0.5
+            if preds.ndim == 5:
+                preds = preds[0, :, 0]  # (T, H, W)
+
+            T = preds.shape[0]
+            if len(paths) < T:
+                raise RuntimeError(f"I target_paths ({len(paths)}) sono meno dei frame predetti ({T}).")
+            if len(paths) > T:
+                # Troncamento conservativo (non generiamo nomi fittizi)
+                paths = list(paths)[:T]
+
+            for t in range(T):
+                stem = os.path.splitext(os.path.basename(paths[t]))[0]
+                key = stem.lower()
+                if key in saved and not overwrite:
+                    continue
+                saved.add(key)
+
+                out_path = os.path.join(out_pred, f"{stem}_pred.tiff")
+                if (not overwrite) and os.path.exists(out_path):
+                    continue
+
+                frame = (preds[t] * 255.0).clip(0, 255).astype(np.uint8)
+                Image.fromarray(frame).save(out_path)
+
+
+def save_all_val_targets(val_loader, out_root, epoch, overwrite=False):
+    ep_dir = os.path.join(out_root, f"epoch_{epoch:03d}")
+    out_targ = os.path.join(ep_dir, "targets")
+    os.makedirs(out_targ, exist_ok=True)
+
+    saved = set()
+    for batch in val_loader:
+        if len(batch) != 4:
+            raise RuntimeError("Validation loader deve restituire (inputs, targets, mask, paths).")
+
+        _, targets, _, paths = batch
+
+        if isinstance(paths, (list, tuple)) and paths and isinstance(paths[0], (list, tuple)):
+            paths = paths[0]
+        if not paths or len(paths) == 0:
+            raise RuntimeError("Mancano i target_paths nella validation: disabilitato il fallback frame_XX.")
+
+        targs = targets.detach().cpu().numpy()
+        targs = targs * 0.5 + 0.5
+        if targs.ndim == 5:
+            targs = targs[0, :, 0]  # (T, H, W)
+
+        T = targs.shape[0]
+        if len(paths) < T:
+            raise RuntimeError(f"I target_paths ({len(paths)}) sono meno dei frame target ({T}).")
+        if len(paths) > T:
+            paths = list(paths)[:T]
+
+        for t in range(T):
+            stem = os.path.splitext(os.path.basename(paths[t]))[0]
+            key = stem.lower()
+            if key in saved and not overwrite:
+                continue
+            saved.add(key)
+
+            out_path = os.path.join(out_targ, f"{stem}_target.tiff")
+            if (not overwrite) and os.path.exists(out_path):
+                continue
+
+            frame = (targs[t] * 255.0).clip(0, 255).astype(np.uint8)
+            Image.fromarray(frame).save(out_path)
+
+ 
 
 # ===============================
 # MAIN
@@ -674,7 +778,9 @@ if __name__ == "__main__":
             val_writer.add_scalar(tag, float(v), epoch)
 
         # salva qualche immagine pred/target dalla VAL
-        save_val_previews(model, val_loader, DEVICE, VAL_PREVIEW_ROOT, epoch, max_batches=2)
+        # save_val_previews(model, val_loader, DEVICE, VAL_PREVIEW_ROOT, epoch, max_batches=2)
+        save_all_val_predictions(model, val_loader, DEVICE, VAL_PREVIEW_ROOT, epoch, overwrite=False)
+        save_all_val_targets(val_loader, VAL_PREVIEW_ROOT, epoch, overwrite=False)
 
         # checkpoint sul best validation
         if val_metrics['TOTAL'] < best_val:
