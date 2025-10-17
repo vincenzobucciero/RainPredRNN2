@@ -1,7 +1,7 @@
 import os, glob, math
 
 # === CONFIG ===
-ROOT = "/storage/external_01/hiwefi/data"     # base dir
+ROOT = "/home/v.bucciero/data/instruments/"     # base dir
 DATA_DIR = os.path.join(ROOT, "rdr0")         # dove sono tutte le .tiff
 OUT_DIR  = os.path.join(ROOT, "rdr0_splits")  # dove creeremo train/val/test
 PATTERN = "**/*.tiff"                         # adatta se serve
