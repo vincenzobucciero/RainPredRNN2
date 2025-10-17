@@ -556,7 +556,7 @@ def evaluate(model, loader, device):
 # ===============================
 # Salvataggi preview dalla VAL
 # ===============================
-'''
+
 def save_predictions_paired(predictions, targets, target_paths, base_out):
     os.makedirs(base_out, exist_ok=True)
     out_pred = os.path.join(base_out, "predictions")
@@ -613,6 +613,7 @@ def save_val_previews(model, val_loader, device, out_root, epoch, max_batches=2)
             targets = targets.to(device, non_blocking=True)
             outputs, _ = model(inputs, PRED_LENGTH)
             save_predictions_paired(outputs, targets, paths, base_out=ep_dir)
+
 '''
 def save_all_val_predictions(model, val_loader, device, out_root, epoch,
                              overwrite=False):
@@ -715,7 +716,7 @@ def save_all_val_targets(val_loader, out_root, epoch, overwrite=False):
 
             frame = (targs[t] * 255.0).clip(0, 255).astype(np.uint8)
             Image.fromarray(frame).save(out_path)
-
+'''
  
 
 # ===============================
@@ -778,9 +779,9 @@ if __name__ == "__main__":
             val_writer.add_scalar(tag, float(v), epoch)
 
         # salva qualche immagine pred/target dalla VAL
-        # save_val_previews(model, val_loader, DEVICE, VAL_PREVIEW_ROOT, epoch, max_batches=2)
-        save_all_val_predictions(model, val_loader, DEVICE, VAL_PREVIEW_ROOT, epoch, overwrite=False)
-        save_all_val_targets(val_loader, VAL_PREVIEW_ROOT, epoch, overwrite=False)
+        save_val_previews(model, val_loader, DEVICE, VAL_PREVIEW_ROOT, epoch, max_batches=2)
+        # save_all_val_predictions(model, val_loader, DEVICE, VAL_PREVIEW_ROOT, epoch, overwrite=False)
+        # save_all_val_targets(val_loader, VAL_PREVIEW_ROOT, epoch, overwrite=False)
 
         # checkpoint sul best validation
         if val_metrics['TOTAL'] < best_val:
