@@ -1,27 +1,51 @@
 #!/bin/bash
 #SBATCH --job-name=rainpred_train
-#SBATCH --partition=xgpu            
-#SBATCH --gres=gpu:tesla:1
+#SBATCH --partition=xgpu
+#SBATCH --gres=gpu:1
 #SBATCH --ntasks=1
-#SBATCH --nodes=1
-#SBATCH --output=logs/output.out
-#SBATCH --error=logs/error.err
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=32G
+#SBATCH --time=06:00:00
+#SBATCH --chdir=/home/v.bucciero/projects/hiwefi/RainPredRNN2
+#SBATCH --output=logs/%x-%j.out
+#SBATCH --error=logs/%x-%j.err
 
-module load cuda/12.2 2>/dev/null || true
+set -euo pipefail
 
+# --- I file di log vengono aperti PRIMA del body: assicura che esista logs/ PRIMA del submit ---
+# Esegui una volta da shell:  mkdir -p /home/v.bucciero/projects/hiwefi/RainPredRNN2/logs
+
+# --- Moduli / ambiente ---
+source /etc/profile.d/modules.sh 2>/dev/null || true
+module load cuda/12.4 2>/dev/null || true
+module load python/3.11.14 2>/dev/null || true
+
+# --- Venv ---
 source /home/v.bucciero/projects/hiwefi/RainPredRNN2/venv3-11/bin/activate
 
+# --- Tuning PyTorch ---
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
 
-echo "=== GPU info ==="
-nvidia-smi
-echo "================"
+echo "=== NODE/GPU INFO ==="
+hostname
+echo "Partition: $SLURM_JOB_PARTITION"
+echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+nvidia-smi || true
+echo "====================="
 
-cd /home/v.bucciero/projects/hiwefi/RainPredRNN2/source
+echo "=== PYTHON/TORCH ==="
+which python
+python --version
+python - <<'PY'
+import torch
+print("torch", torch.__version__)
+print("cuda available?", torch.cuda.is_available())
+print("device count", torch.cuda.device_count())
+PY
+echo "===================="
 
-python -u app9.py
+# --- Avvio ---
+python -u source/app9.py
 
-# --------------------------------------------------------------------
-# Fine job
-# --------------------------------------------------------------------
 echo "Training terminato alle: $(date)"
