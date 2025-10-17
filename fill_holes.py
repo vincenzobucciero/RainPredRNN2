@@ -1,7 +1,7 @@
 # fill_holes.py
 import os, shutil, sys
 
-ROOT = sys.argv[1] if len(sys.argv) > 1 else "/storage/external_01/hiwefi/data/rdr0_splits/val"
+ROOT = sys.argv[1] if len(sys.argv) > 1 else "/storage/external_01/hiwefi/data/rdr0_5k_splits/train"
 MIN_SIZE = 1024  # byte: < MIN_SIZE lo consideriamo buco (es. 128 B)
 LOG_PATH = os.path.join(ROOT, "_fillholes_log.txt")
 
