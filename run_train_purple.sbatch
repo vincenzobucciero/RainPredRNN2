@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=rainpred_train
-#SBATCH --partition=h100gpu
+#SBATCH --partition=xgpu
 #SBATCH --gres=gpu:1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -12,10 +12,6 @@
 
 set -euo pipefail
 
-# --- I file di log vengono aperti PRIMA del body: assicura che esista logs/ PRIMA del submit ---
-# Esegui una volta da shell:  mkdir -p /home/v.bucciero/projects/hiwefi/RainPredRNN2/logs
-
-# --- Moduli / ambiente ---
 source /etc/profile.d/modules.sh 2>/dev/null || true
 module load cuda/12.4 2>/dev/null || true
 module load python/3.11.14 2>/dev/null || true
@@ -23,7 +19,6 @@ module load python/3.11.14 2>/dev/null || true
 # --- Venv ---
 source /home/v.bucciero/projects/hiwefi/RainPredRNN2/venv3-11/bin/activate
 
-# --- Tuning PyTorch ---
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 
@@ -45,7 +40,6 @@ print("device count", torch.cuda.device_count())
 PY
 echo "===================="
 
-# --- Avvio ---
 python -u source/app9.py
 
 echo "Training terminato alle: $(date)"
