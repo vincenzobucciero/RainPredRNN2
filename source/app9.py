@@ -731,7 +731,7 @@ if __name__ == "__main__":
     print(f"[Benchmark] Val  : ~{bps_val:.2f} batch/s | steps/val  ={steps_val}   | ETA val   ≈ {_hms(eta_val)}")
 
     # dove salvo le anteprime dalla validation ad ogni epoca
-    VAL_PREVIEW_ROOT = "/home/v.bucciero/data/instruments/rdr0_previews"
+    VAL_PREVIEW_ROOT = "/home/v.bucciero/data/instruments/rdr0_previews_h100gpu"
     os.makedirs(VAL_PREVIEW_ROOT, exist_ok=True)
 
     best_val = float('inf')
