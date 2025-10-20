@@ -51,6 +51,6 @@ PY
 echo "===================="
 
 # Avvio training (il file ottimizzato che mi hai chiesto)
-python -u source/app9.py
+python -u source/app10.py
 
 echo "Training terminato alle: $(date)"
