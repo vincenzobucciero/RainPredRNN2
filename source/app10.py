@@ -32,26 +32,21 @@ from torch.utils.tensorboard.writer import SummaryWriter
 # =========================================
 # Config "pro-GPU"
 # =========================================
-# Suggerimento cluster:
-# export OMP_NUM_THREADS=1
-# #SBATCH --cpus-per-task=32 (o più, se disponibili)
-
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Batch iniziale alto: verrà auto-ridotto se OOM
 INIT_BATCH_SIZE = 64
 MAX_NUM_WORKERS = 32
 LEARNING_RATE = 1e-3
 NUM_EPOCHS = 1
 PRED_LENGTH = 6
 PIN_MEMORY = True
-USE_AMP = True  # mixed precision
-USE_BF16 = True # H100: bfloat16 consigliato
-TORCH_COMPILE = True  # PyTorch 2.x: prova torch.compile
+USE_AMP = True
+USE_BF16 = True  # H100 consigliato
+TORCH_COMPILE = True
 BENCH_WARMUP = 10
 BENCH_MEASURE = 50
 
-# Ottimizzazioni globali per H100
+# Ottimizzazioni globali
 torch.backends.cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -68,6 +63,13 @@ def set_seed(seed=15):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 set_seed()
+
+def _hms(sec: float):
+    sec = int(max(0, sec))
+    h = sec // 3600
+    m = (sec % 3600) // 60
+    s = sec % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
 
 def normalize_image(img):
     img = np.nan_to_num(img, nan=0.0, posinf=0.0, neginf=0.0)
@@ -90,13 +92,6 @@ def tiff_is_readable_quick(path):
     except Exception:
         return False
 
-def _hms(sec: float):
-    sec = int(max(0, sec))
-    h = sec // 3600
-    m = (sec % 3600) // 60
-    s = sec % 60
-    return f"{h:02d}:{m:02d}:{s:02d}"
-
 @contextmanager
 def autocast_ctx():
     if DEVICE == "cuda" and USE_AMP:
@@ -108,6 +103,16 @@ def autocast_ctx():
                 yield
     else:
         yield
+
+def to_dev_cl4(t: torch.Tensor, device: str):
+    """
+    Sposta su device e applica channels_last SOLO se il tensore è 4D (N, C, H, W).
+    Evita l'errore 'required rank 4 tensor to use channels_last format'.
+    """
+    t = t.to(device, non_blocking=True)
+    if t.dim() == 4:
+        t = t.contiguous(memory_format=torch.channels_last)
+    return t
 
 # =========================================
 # Dataset
@@ -131,7 +136,6 @@ class RadarDataset(Dataset):
             raise RuntimeError(f"Troppi pochi file in {data_path}: {len(self.files)} < seq_length={self.seq_length}")
 
         self.is_train = is_train
-        # Canale singolo → torchvision Normalize(0.5,0.5)
         self.transform = transforms.Compose([
             transforms.Resize((224, 224)),
             transforms.ToTensor(),                       # (C,H,W) in [0,1]
@@ -231,6 +235,7 @@ class RadarDataset(Dataset):
             inputs  = all_frames[:, :self.input_length]       # (C, Tin, H, W)
             targets = all_frames[:, self.input_length:]       # (C, Tout, H, W)
 
+            # 4D → ok usare channels_last (N=Tin/Tout)
             inputs  = inputs.permute(1, 0, 2, 3).contiguous(memory_format=torch.channels_last)   # (Tin, C, H, W)
             targets = targets.permute(1, 0, 2, 3).contiguous(memory_format=torch.channels_last)  # (Tout, C, H, W)
 
@@ -366,7 +371,7 @@ class RainPredRNN(nn.Module):
         return torch.stack(preds, dim=1), torch.stack(preds_noact, dim=1)
 
 # =========================================
-# Collate Fn (VALIDAZIONE)
+# Collate Fn (VALIDAZIONE) — niente channels_last qui (5D)
 # =========================================
 def collate_val(batch):
     item = batch[0]
@@ -381,18 +386,9 @@ def collate_val(batch):
     else:
         paths = [paths]
 
-    if inputs.dim() == 4:
-        inputs = inputs.unsqueeze(0)
-    if targets.dim() == 4:
-        targets = targets.unsqueeze(0)
-    if mask is not None and mask.dim() == 4:
-        mask = mask.unsqueeze(0)
-
-    # channels_last per velocizzare convoluzioni
-    inputs  = inputs.contiguous(memory_format=torch.channels_last)
-    targets = targets.contiguous(memory_format=torch.channels_last)
-    if mask is not None:
-        mask = mask.contiguous(memory_format=torch.channels_last)
+    if inputs.dim() == 4:  inputs  = inputs.unsqueeze(0)  # -> (1, Tin, C, H, W)
+    if targets.dim() == 4: targets = targets.unsqueeze(0)
+    if mask is not None and mask.dim() == 4: mask = mask.unsqueeze(0)
 
     return inputs, targets, mask, paths
 
@@ -401,12 +397,10 @@ def collate_val(batch):
 # =========================================
 def _pin_kwargs():
     kwargs = {}
-    if hasattr(torch.utils.data, "DataLoader"):
-        # pin_memory_device (PyTorch 2.0+)
-        try:
-            kwargs["pin_memory_device"] = "cuda"
-        except TypeError:
-            pass
+    try:
+        kwargs["pin_memory_device"] = "cuda"
+    except TypeError:
+        pass
     return kwargs
 
 def create_dataloaders(data_path, batch_size=64, num_workers=32):
@@ -437,29 +431,25 @@ def create_dataloaders(data_path, batch_size=64, num_workers=32):
     return train_loader, val_loader
 
 def autotune_batch_size(model, data_path, init_bs=64, num_workers=32):
-    """Prova batch size decrescente finché una short-run forward/backward non va OOM."""
     bs = max(1, int(init_bs))
     while bs >= 1:
         try:
             train_loader, val_loader = create_dataloaders(data_path, bs, num_workers)
-            # Prova un singolo step
             model.train()
             optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-            scaler = torch.cuda.amp.GradScaler(enabled=(USE_AMP and DEVICE == "cuda"))
+            scaler = torch.cuda.amp.GradScaler(enabled=(USE_AMP and DEVICE == "cuda" and not USE_BF16))
             batch = next(iter(train_loader))
             inputs, targets, mask = batch[:3]
-            inputs  = inputs.to(DEVICE, non_blocking=True).contiguous(memory_format=torch.channels_last)
-            targets = targets.to(DEVICE, non_blocking=True).contiguous(memory_format=torch.channels_last)
-            mask    = mask.to(DEVICE, non_blocking=True).contiguous(memory_format=torch.channels_last)
+            inputs  = to_dev_cl4(inputs,  DEVICE)
+            targets = to_dev_cl4(targets, DEVICE)
+            mask    = to_dev_cl4(mask,    DEVICE)
             optimizer.zero_grad(set_to_none=True)
             with autocast_ctx():
                 outputs, logits = model(inputs, PRED_LENGTH)
                 loss = F.smooth_l1_loss(outputs, targets)*10 + vops.sigmoid_focal_loss(logits, mask, reduction='mean')*10
             if torch.cuda.is_available(): torch.cuda.synchronize()
-            if USE_AMP:
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
+            if USE_AMP and not USE_BF16:
+                scaler.scale(loss).backward(); scaler.step(optimizer); scaler.update()
             else:
                 loss.backward(); optimizer.step()
             del optimizer, scaler, batch, inputs, targets, mask, outputs, logits, loss
@@ -482,9 +472,9 @@ def benchmark_train(loader, model, optimizer, device, scaler=None, warmup=10, me
     for _ in range(warmup):
         batch = next(it)
         inputs, targets, mask = batch[:3]
-        inputs  = inputs.to(device, non_blocking=True).contiguous(memory_format=torch.channels_last)
-        targets = targets.to(device, non_blocking=True).contiguous(memory_format=torch.channels_last)
-        mask    = mask.to(device, non_blocking=True).contiguous(memory_format=torch.channels_last)
+        inputs  = to_dev_cl4(inputs,  device)
+        targets = to_dev_cl4(targets, device)
+        mask    = to_dev_cl4(mask,    device)
         optimizer.zero_grad(set_to_none=True)
         with autocast_ctx():
             outputs, logits = model(inputs, PRED_LENGTH)
@@ -503,9 +493,9 @@ def benchmark_train(loader, model, optimizer, device, scaler=None, warmup=10, me
         except StopIteration:
             break
         inputs, targets, mask = batch[:3]
-        inputs  = inputs.to(device, non_blocking=True).contiguous(memory_format=torch.channels_last)
-        targets = targets.to(device, non_blocking=True).contiguous(memory_format=torch.channels_last)
-        mask    = mask.to(device, non_blocking=True).contiguous(memory_format=torch.channels_last)
+        inputs  = to_dev_cl4(inputs,  device)
+        targets = to_dev_cl4(targets, device)
+        mask    = to_dev_cl4(mask,    device)
         optimizer.zero_grad(set_to_none=True)
         with autocast_ctx():
             outputs, logits = model(inputs, PRED_LENGTH)
@@ -525,7 +515,7 @@ def benchmark_val(loader, model, device, warmup=10, measure=50):
     with torch.no_grad():
         for _ in range(warmup):
             batch = next(it)
-            inputs = batch[0].to(device, non_blocking=True).contiguous(memory_format=torch.channels_last)
+            inputs = to_dev_cl4(batch[0], device)
             with autocast_ctx():
                 _ = model(inputs, PRED_LENGTH)
         if torch.cuda.is_available(): torch.cuda.synchronize()
@@ -536,7 +526,7 @@ def benchmark_val(loader, model, device, warmup=10, measure=50):
                 batch = next(it)
             except StopIteration:
                 break
-            inputs = batch[0].to(device, non_blocking=True).contiguous(memory_format=torch.channels_last)
+            inputs = to_dev_cl4(batch[0], device)
             with autocast_ctx():
                 _ = model(inputs, PRED_LENGTH)
             counted += 1
@@ -561,7 +551,6 @@ def calculate_metrics(preds, targets, logits=None, mask=None, threshold_dbz=15):
     fl = 0
     if (logits is not None) and (mask is not None):
         fl = criterion_fl(logits, mask)
-
     total = sl1 + fl
 
     p = preds.numpy().squeeze()
@@ -597,9 +586,9 @@ def train_epoch(model, loader, optimizer, device, scaler=None, log_window=200):
     total_loss = 0.0
     t_last = time.time()
     for step, (inputs, targets, mask) in enumerate(loader, start=1):
-        inputs  = inputs.to(device, non_blocking=True).contiguous(memory_format=torch.channels_last)
-        targets = targets.to(device, non_blocking=True).contiguous(memory_format=torch.channels_last)
-        mask    = mask.to(device, non_blocking=True).contiguous(memory_format=torch.channels_last)
+        inputs  = to_dev_cl4(inputs,  device)
+        targets = to_dev_cl4(targets, device)
+        mask    = to_dev_cl4(mask,    device)
 
         optimizer.zero_grad(set_to_none=True)
         with autocast_ctx():
@@ -607,7 +596,7 @@ def train_epoch(model, loader, optimizer, device, scaler=None, log_window=200):
             loss = criterion_sl1(outputs, targets) * criterion_mae_lambda
             loss += criterion_fl(logits, mask) * criterion_mae_lambda
 
-        if scaler is not None:
+        if scaler is not None and USE_AMP and not USE_BF16:
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -617,7 +606,6 @@ def train_epoch(model, loader, optimizer, device, scaler=None, log_window=200):
 
         total_loss += float(loss.detach().cpu())
 
-        # ETA/bps "reale" a finestra
         if step % log_window == 0:
             now = time.time()
             bps = log_window / (now - t_last + 1e-9)
@@ -636,9 +624,9 @@ def evaluate(model, loader, device):
                 inputs, targets, mask, _ = batch
             else:
                 inputs, targets, mask = batch
-            inputs  = inputs.to(device, non_blocking=True).contiguous(memory_format=torch.channels_last)
-            targets = targets.to(device, non_blocking=True).contiguous(memory_format=torch.channels_last)
-            mask    = mask.to(device, non_blocking=True).contiguous(memory_format=torch.channels_last)
+            inputs  = to_dev_cl4(inputs,  device)
+            targets = to_dev_cl4(targets, device)
+            mask    = to_dev_cl4(mask,    device)
             with autocast_ctx():
                 outputs, logits = model(inputs, PRED_LENGTH)
             m = calculate_metrics(outputs, targets, logits, mask)
@@ -667,7 +655,7 @@ def save_all_val_predictions(model, val_loader, device, out_root, epoch, overwri
             if not paths or len(paths) == 0:
                 raise RuntimeError("Mancano i target_paths nella validation: disabilitato il fallback frame_XX.")
 
-            inputs  = inputs.to(device, non_blocking=True).contiguous(memory_format=torch.channels_last)
+            inputs  = to_dev_cl4(inputs, device)
             with autocast_ctx():
                 outputs, _ = model(inputs, PRED_LENGTH)  # (1, T, 1, H, W)
 
@@ -747,10 +735,9 @@ if __name__ == "__main__":
     train_writer = SummaryWriter(log_dir=os.path.join(log_dir, "Train"))
     val_writer   = SummaryWriter(log_dir=os.path.join(log_dir, "Validation"))
 
-    # Model
     model = RainPredRNN(input_dim=1, num_hidden=256, max_hidden_channels=128,
-                        patch_height=16, patch_width=16)
-    model = model.to(DEVICE)
+                        patch_height=16, patch_width=16).to(DEVICE)
+    # Facoltativo: predisposizione channels_last per i layer conv
     model = model.to(memory_format=torch.channels_last)
     if TORCH_COMPILE and hasattr(torch, "compile"):
         try:
@@ -773,10 +760,11 @@ if __name__ == "__main__":
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5)
     scaler = torch.cuda.amp.GradScaler(enabled=(USE_AMP and DEVICE == "cuda" and not USE_BF16))
 
-    # Benchmark (più realistico)
+    # Benchmark realistico
     steps_train = len(train_loader)
     steps_val = len(val_loader)
-    bps_train = benchmark_train(train_loader, model, optimizer, DEVICE, scaler=scaler, warmup=BENCH_WARMUP, measure=BENCH_MEASURE)
+    bps_train = benchmark_train(train_loader, model, optimizer, DEVICE, scaler=scaler,
+                                warmup=BENCH_WARMUP, measure=BENCH_MEASURE)
     bps_val   = benchmark_val(val_loader,   model, DEVICE, warmup=BENCH_WARMUP, measure=BENCH_MEASURE)
     eta_train = steps_train / bps_train if bps_train > 0 else float('inf')
     eta_val   = steps_val   / bps_val   if bps_val   > 0 else float('inf')
