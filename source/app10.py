@@ -9,6 +9,9 @@ from PIL import Image
 from contextlib import contextmanager
 
 import torch
+import torch._dynamo  # <— sopprime errori di Dynamo quando non usiamo compile
+torch._dynamo.config.suppress_errors = True
+
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
@@ -42,7 +45,7 @@ PRED_LENGTH = 6
 PIN_MEMORY = True
 USE_AMP = True
 USE_BF16 = True  # H100 consigliato
-TORCH_COMPILE = True
+TORCH_COMPILE = False  # <— disattivato per evitare errori di build gcc/C99
 BENCH_WARMUP = 10
 BENCH_MEASURE = 50
 
@@ -393,7 +396,7 @@ def collate_val(batch):
     return inputs, targets, mask, paths
 
 # =========================================
-# Dataloaders + autotuning batch size
+# Dataloaders + autotuning batch size (definito ma NON usato nel main)
 # =========================================
 def _pin_kwargs():
     kwargs = {}
@@ -737,7 +740,7 @@ if __name__ == "__main__":
 
     model = RainPredRNN(input_dim=1, num_hidden=256, max_hidden_channels=128,
                         patch_height=16, patch_width=16).to(DEVICE)
-    # Facoltativo: predisposizione channels_last per i layer conv
+    # Predisposizione channels_last per layer conv
     model = model.to(memory_format=torch.channels_last)
     if TORCH_COMPILE and hasattr(torch, "compile"):
         try:
@@ -746,15 +749,12 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"[Compile] torch.compile disabilitato: {e}")
 
-    # Autotune batch size + dataloaders
-    bs_guess = INIT_BATCH_SIZE
-    try:
-        bs, train_loader, val_loader = autotune_batch_size(model, DATA_PATH, init_bs=bs_guess, num_workers=MAX_NUM_WORKERS)
-    except Exception as e:
-        print(f"[AutoBS] Fallito autotuning ({e}), uso batch size 4 come fallback.")
-        bs = 4
-        train_loader, val_loader = create_dataloaders(DATA_PATH, batch_size=bs, num_workers=MAX_NUM_WORKERS)
-    print(f"[Config] Batch size finale: {bs} | Workers: {MAX_NUM_WORKERS}")
+    # === Forza batch size grande (puoi salire a 128/256 se la VRAM lo permette)
+    bs = 64
+    train_loader, val_loader = create_dataloaders(
+        DATA_PATH, batch_size=bs, num_workers=MAX_NUM_WORKERS
+    )
+    print(f"[Config] Batch size forzato: {bs} | Workers: {MAX_NUM_WORKERS}")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5)

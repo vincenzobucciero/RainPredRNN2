@@ -1,11 +1,10 @@
 #!/bin/bash
 #SBATCH --job-name=rainpred_train
 #SBATCH --partition=h100gpu
-## Su alcuni cluster è preferibile --gpus=1 invece di --gres
 #SBATCH --gres=gpu:1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=32          # ↑ serve a tenere vivi molti DataLoader workers
-#SBATCH --mem=64G                   # ↑ spazio per tanti worker + cache decode
+#SBATCH --cpus-per-task=32          # tanti worker per il DataLoader
+#SBATCH --mem=64G                   # RAM adeguata a molti worker/prefetch
 #SBATCH --time=06:00:00
 #SBATCH --chdir=/home/v.bucciero/projects/hiwefi/RainPredRNN2
 #SBATCH --output=logs/%x-%j.out
@@ -13,22 +12,25 @@
 
 set -euo pipefail
 
-# --- Moduli (adatta ai nomi del tuo ambiente) ---
+# --- Moduli ---
 source /etc/profile.d/modules.sh 2>/dev/null || true
 module load cuda/12.4 2>/dev/null || true
 module load python/3.11.14 2>/dev/null || true
+module load gcc/10 2>/dev/null || true   # gcc recente se disponibile
 
 # --- Venv ---
 source /home/v.bucciero/projects/hiwefi/RainPredRNN2/venv3-11/bin/activate
 
-# --- Env per performance/stabilità ---
-export OMP_NUM_THREADS=1                # evita oversubscription BLAS/OpenMP
+# --- Env performance/stabilità ---
+export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export NUMEXPR_MAX_THREADS=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
-# tante TIFF → alza i file descriptor
 ulimit -n 65536 || true
+
+# Se in futuro riattivi torch.compile/Inductor: forza C99 per estensioni C generate
+export CFLAGS="${CFLAGS:-} -std=gnu99"
 
 echo "=== NODE/GPU INFO ==="
 hostname
@@ -50,7 +52,7 @@ print("matmul tf32 allowed?", torch.backends.cuda.matmul.allow_tf32)
 PY
 echo "===================="
 
-# Avvio training (il file ottimizzato che mi hai chiesto)
+# Avvio training
 python -u source/app10.py
 
 echo "Training terminato alle: $(date)"
