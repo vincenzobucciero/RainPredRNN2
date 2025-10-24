@@ -5,7 +5,7 @@ ROOT = "/home/v.bucciero/data/instruments/"     # base dir
 DATA_DIR = os.path.join(ROOT, "rdr0")         # dove sono tutte le .tiff
 OUT_DIR  = os.path.join(ROOT, "rdr0_splits")  # dove creeremo train/val/test
 PATTERN = "**/*.tiff"                         # adatta se serve
-RATIOS = (0.70, 0.15, 0.15)                   # train, val, test
+RATIOS = (0.90, 0.09, 0.01)                   # train, val, test
 DRY_RUN = False                               # True per provare senza creare symlink
 
 def ensure_dir(p):
