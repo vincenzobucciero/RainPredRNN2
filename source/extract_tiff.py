@@ -4,7 +4,7 @@ import shutil
 
 # === Percorsi sorgente e destinazione ===
 SRC_ROOT = os.path.expanduser("~/data/instruments/rdr0_splits/val")
-DST_DIR  = os.path.expanduser("~/projects/hiwefi/RainPredRNN2")
+DST_DIR  = os.path.expanduser("~/projects/hiwefi/RainPredRNN2/extracted_tiff")
 
 # === Numero di file da estrarre ===
 N_FILES = 18
