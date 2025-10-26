@@ -13,7 +13,7 @@ from app9 import RainPredRNN, PRED_LENGTH
 
 # ====== CONFIG ======
 CKPT_PATH  = "/home/v.bucciero/projects/hiwefi/RainPredRNN2/checkpoints/best_model.pth"
-INPUT_DIR  = "/path/solo_18_tiff"            # <-- METTI la cartella con i 18 TIFF
+INPUT_DIR  = "/home/v.bucciero/projects/hiwefi/RainPredRNN2/extracted_tiff"     
 OUTPUT_DIR = "./pred_out"                    # dove salvare le 6 predizioni
 REPEATS    = 50                              # n. misure
 WARMUP     = 10                              # warm-up
