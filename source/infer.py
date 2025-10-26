@@ -98,8 +98,6 @@ def main():
     if device == "cuda":
         torch.backends.cudnn.benchmark = True
         torch.set_float32_matmul_precision("high")
-        inputs = inputs.contiguous(non_blocking=True)
-        model = model  # nothing to do here
 
 
     # warm-up
