@@ -1,3 +1,5 @@
+# -*- coding: utf-8 -*-
+
 import os, re, time, statistics, datetime, glob
 import numpy as np
 from PIL import Image
