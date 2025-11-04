@@ -40,6 +40,6 @@ print("device count", torch.cuda.device_count())
 PY
 echo "===================="
 
-python -u source/app9.py
+python -u source/app10.py
 
 echo "Training terminato alle: $(date)"
