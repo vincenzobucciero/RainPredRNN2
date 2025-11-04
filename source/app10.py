@@ -3,14 +3,9 @@ import math
 import glob
 import datetime
 import time
-import csv
 import numpy as np
 from functools import partial
 from PIL import Image
-
-import matplotlib
-matplotlib.use("Agg")  # backend non interattivo per salvare PNG
-import matplotlib.pyplot as plt
 
 import torch
 import torch.nn as nn
@@ -45,9 +40,6 @@ NUM_EPOCHS = 1
 PRED_LENGTH = 6
 pin_memory = True
 USE_AMP = True  # mixed precision su GPU moderne
-
-# Soglie dBZ per confusion/metriche (puoi cambiare qui)
-THRESHOLDS_DBZ = (5, 15, 30, 40)
 
 # ===============================
 # Utils / Seed
@@ -508,7 +500,7 @@ def benchmark_val(loader, model, device, warmup=2, measure=20):
 
 
 # ===============================
-# Metriche & Train/Eval (base)
+# Metriche & Train/Eval
 # ===============================
 criterion_sl1 = nn.SmoothL1Loss()
 criterion_mae = nn.L1Loss()
@@ -583,121 +575,81 @@ def train_epoch(model, loader, optimizer, device, scaler=None):
     
     return total_loss / max(1, len(loader))
 
+def generate_evaluation_report(metrics_dict, conf_matrix, output_dir):
+    """Generate a detailed evaluation report with metrics and confusion matrix"""
+    os.makedirs(output_dir, exist_ok=True)
+    report_path = os.path.join(output_dir, "evaluation_report.txt")
+    
+    with open(report_path, 'w') as f:
+        f.write("=== RainPredRNN Evaluation Report ===\n\n")
+        
+        # Write metrics
+        f.write("Metrics:\n")
+        f.write("-" * 40 + "\n")
+        for metric, value in metrics_dict.items():
+            f.write(f"{metric:15s}: {value:.4f}\n")
+        f.write("\n")
+        
+        # Write confusion matrix
+        f.write("Confusion Matrix:\n")
+        f.write("-" * 40 + "\n")
+        f.write("Format: [[TN, FP],\n        [FN, TP]]\n\n")
+        f.write(str(conf_matrix))
+        f.write("\n\n")
+        
+        # Calculate and write additional metrics
+        tn, fp, fn, tp = conf_matrix.ravel()
+        precision = tp / (tp + fp + 1e-10)
+        recall = tp / (tp + fn + 1e-10)
+        f1 = 2 * precision * recall / (precision + recall + 1e-10)
+        accuracy = (tp + tn) / (tp + tn + fp + fn + 1e-10)
+        
+        f.write("Additional Metrics:\n")
+        f.write("-" * 40 + "\n")
+        f.write(f"Precision:  {precision:.4f}\n")
+        f.write(f"Recall:     {recall:.4f}\n")
+        f.write(f"F1 Score:   {f1:.4f}\n")
+        f.write(f"Accuracy:   {accuracy:.4f}\n")
 
-# ===============================
-# Estensioni: confusion matrix & metriche derivate
-# ===============================
-def _binarize_from_scaled(x01, thr_dbz):
-    """x01 è [0,1]; mappa a dBZ e binarizza."""
-    dbz = np.clip(x01 * 70.0, 0.0, 70.0)
-    return (dbz > thr_dbz).astype(np.uint8)
-
-def _confusion_counts(y_true_bin, y_pred_bin):
-    """Restituisce tn, fp, fn, tp come interi."""
-    cm = confusion_matrix(y_true_bin.flatten(), y_pred_bin.flatten(), labels=[0,1])
-    if cm.shape == (2,2):
-        tn, fp, fn, tp = cm.ravel()
-    else:
-        tn, fp, fn, tp = 0, 0, 0, 0
-    return int(tn), int(fp), int(fn), int(tp)
-
-def _metrics_from_cm(tn, fp, fn, tp):
-    """Calcola un set completo di metriche a partire da TN/FP/FN/TP."""
-    eps = 1e-10
-    precision = tp / (tp + fp + eps)
-    recall    = tp / (tp + fn + eps)  # POD / sensitivity
-    f1        = 2 * precision * recall / (precision + recall + eps)
-    csi       = tp / (tp + fp + fn + eps)
-    far       = fp / (tp + fp + eps)
-    # Heidke Skill Score (HSS) e Equitable Threat Score (ETS)
-    n   = tn + fp + fn + tp + eps
-    pc  = ((tp + tn) / n)
-    pe  = (((tp + fn) * (tp + fp)) + ((fp + tn) * (fn + tn))) / (n * n)
-    hss = (pc - pe) / (1 - pe + eps)
-    # ETS
-    random = ((tp + fp) * (tp + fn)) / n
-    ets = (tp - random) / (tp + fp + fn - random + eps)
-    return {
-        "TP": tp, "FP": fp, "TN": tn, "FN": fn,
-        "Precision": precision, "Recall": recall, "F1": f1,
-        "CSI": csi, "FAR": far, "HSS": hss, "ETS": ets
-    }
-
-def _plot_confusion_matrix(tn, fp, fn, tp, title, out_png=None, writer=None, global_step=None):
-    """Disegna e salva/manda a TensorBoard la matrice di confusione 2x2."""
-    mat = np.array([[tn, fp],
-                    [fn, tp]], dtype=np.int64)
-    fig, ax = plt.subplots(figsize=(3.4, 3.4))
-    ax.imshow(mat, interpolation="nearest")
-    ax.set_title(title)
-    ax.set_xticks([0,1]); ax.set_yticks([0,1])
-    ax.set_xticklabels(["Pred 0","Pred 1"]); ax.set_yticklabels(["True 0","True 1"])
-    for i in range(2):
-        for j in range(2):
-            ax.text(j, i, f"{mat[i, j]:,}", ha="center", va="center")
-    ax.set_xlabel("Predicted"); ax.set_ylabel("True")
-    fig.tight_layout()
-    if out_png:
-        fig.savefig(out_png, dpi=150)
-    if writer is not None:
-        writer.add_figure(title, fig, global_step=global_step, close=True)
-    plt.close(fig)
-
-def evaluate_with_confusion(model, loader, device, thresholds_dbz=(15,), max_batches=None):
-    """
-    Forward su 'loader' e aggrega confusion matrix e metriche per ciascuna soglia.
-    Ritorna: dict 'losses' + dict 'per_threshold' (ognuna con TN/FP/FN/TP e metriche).
-    """
+def evaluate(model, loader, device):
     model.eval()
-    agg_losses = {'MAE':0.0,'SSIM':0.0,'CSI':0.0,'SmoothL1':0.0,'FL':0.0,'TOTAL':0.0}
-    # per soglia → contatori cumulativi
-    counters = {thr: {'tn':0,'fp':0,'fn':0,'tp':0} for thr in thresholds_dbz}
-
-    seen = 0
+    agg = {'MAE':0.0,'SSIM':0.0,'CSI':0.0,'SmoothL1':0.0,'FL':0.0,'TOTAL':0.0}
+    all_preds = []
+    all_targets = []
+    
     with torch.no_grad():
-        for ib, batch in enumerate(loader):
-            if (max_batches is not None) and (ib >= max_batches):
-                break
+        for batch in loader:
             if len(batch) == 4:
                 inputs, targets, mask, _ = batch
             else:
                 inputs, targets, mask = batch
-
-            inputs  = inputs.to(device, non_blocking=True)
+            inputs = inputs.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
-            mask    = mask.to(device, non_blocking=True)
-
+            mask = mask.to(device, non_blocking=True)
             outputs, logits = model(inputs, PRED_LENGTH)
             m = calculate_metrics(outputs, targets, logits, mask)
-            for k in agg_losses: agg_losses[k] += float(m[k])
-
-            # ---- Confusion per soglie ----
-            # scala a [0,1]
-            p = outputs.detach().cpu().numpy()
-            t = targets.detach().cpu().numpy()
-            if p.ndim == 5:  # (B,T,1,H,W)
-                p = p[:, :, 0]
-                t = t[:, :, 0]
-            p01 = np.clip(p * 0.5 + 0.5, 0.0, 1.0)
-            t01 = np.clip(t * 0.5 + 0.5, 0.0, 1.0)
-            for thr in thresholds_dbz:
-                p_bin = _binarize_from_scaled(p01, thr)
-                t_bin = _binarize_from_scaled(t01, thr)
-                tn, fp, fn, tp = _confusion_counts(t_bin, p_bin)
-                counters[thr]['tn'] += tn
-                counters[thr]['fp'] += fp
-                counters[thr]['fn'] += fn
-                counters[thr]['tp'] += tp
-            seen += 1
-
-    denom = float(max(1, seen))
-    for k in agg_losses: agg_losses[k] /= denom
-
-    per_thr = {}
-    for thr, c in counters.items():
-        per_thr[thr] = _metrics_from_cm(c['tn'], c['fp'], c['fn'], c['tp'])
-
-    return agg_losses, per_thr
+            for k in agg: agg[k] += float(m[k])
+            
+            # Collect predictions and targets for confusion matrix
+            preds = outputs.detach().cpu().numpy()
+            targets_np = targets.detach().cpu().numpy()
+            preds = preds * 0.5 + 0.5
+            targets_np = targets_np * 0.5 + 0.5
+            preds_dbz = np.clip(preds * 70.0, 0, 70)
+            targets_dbz = np.clip(targets_np * 70.0, 0, 70)
+            preds_bin = (preds_dbz > 15).astype(np.uint8)
+            targets_bin = (targets_dbz > 15).astype(np.uint8)
+            all_preds.extend(preds_bin.flatten())
+            all_targets.extend(targets_bin.flatten())
+            
+    # Calculate final metrics
+    for k in agg: agg[k] /= float(max(1, len(loader)))
+    
+    # Calculate confusion matrix
+    conf_matrix = confusion_matrix(all_targets, all_preds, labels=[0,1])
+    
+    torch.cuda.empty_cache()
+    return agg, conf_matrix
 
 
 # ===============================
@@ -829,15 +781,11 @@ if __name__ == "__main__":
     bps_train = benchmark_train(train_loader, model, optimizer, DEVICE, scaler=scaler, warmup=2, measure=10)
     bps_val   = benchmark_val(val_loader, model, DEVICE, warmup=2, measure=50)
 
-    def _hms_loc(sec: float):
-        sec = 0 if (sec is None or sec == float('inf')) else sec
-        return _hms(sec)
-
     eta_train = steps_train / bps_train if bps_train > 0 else float('inf')
     eta_val   = steps_val   / bps_val   if bps_val   > 0 else float('inf')
 
-    print(f"[Benchmark] Train: ~{bps_train:.2f} batch/s | steps/epoch={steps_train} | ETA epoca ≈ {_hms_loc(eta_train)}")
-    print(f"[Benchmark] Val  : ~{bps_val:.2f} batch/s | steps/val  ={steps_val}   | ETA val   ≈ {_hms_loc(eta_val)}")
+    print(f"[Benchmark] Train: ~{bps_train:.2f} batch/s | steps/epoch={steps_train} | ETA epoca ≈ {_hms(eta_train)}")
+    print(f"[Benchmark] Val  : ~{bps_val:.2f} batch/s | steps/val  ={steps_val}   | ETA val   ≈ {_hms(eta_val)}")
 
     # dove salvo le anteprime dalla validation ad ogni epoca
     VAL_PREVIEW_ROOT = "/home/v.bucciero/data/instruments/rdr0_previews_h100gpu"
@@ -846,105 +794,37 @@ if __name__ == "__main__":
     best_val = float('inf')
     CHECKPOINT_DIR = "checkpoints"; os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-    # CSV per metriche per-epoca
-    csv_path = os.path.join(log_dir, "metrics_per_epoch.csv")
-    with open(csv_path, "w", newline="") as f:
-        w = csv.writer(f)
-        # header dinamico
-        header = ["epoch","split","TOTAL","SmoothL1","MAE","FL","SSIM"]
-        for thr in THRESHOLDS_DBZ:
-            header += [f"{thr}dBZ_TP", f"{thr}dBZ_FP", f"{thr}dBZ_TN", f"{thr}dBZ_FN",
-                       f"{thr}dBZ_Precision", f"{thr}dBZ_Recall", f"{thr}dBZ_F1",
-                       f"{thr}dBZ_CSI", f"{thr}dBZ_FAR", f"{thr}dBZ_HSS", f"{thr}dBZ_ETS"]
-        w.writerow(header)
-
     for epoch in range(NUM_EPOCHS):
         print(f"Epoch {epoch+1}/{NUM_EPOCHS}")
         train_loss = train_epoch(model, train_loader, optimizer, DEVICE, scaler=scaler)
+        val_metrics, conf_matrix = evaluate(model, val_loader, DEVICE)
+        scheduler.step(val_metrics['TOTAL'])
 
-        # --- EVAL TRAIN (puoi mettere max_batches=N per velocizzare)
-        train_losses, train_thr = evaluate_with_confusion(
-            model, train_loader, DEVICE, thresholds_dbz=THRESHOLDS_DBZ, max_batches=None
-        )
-        # --- EVAL VAL
-        val_losses, val_thr = evaluate_with_confusion(
-            model, val_loader, DEVICE, thresholds_dbz=THRESHOLDS_DBZ, max_batches=None
-        )
+        print(f"\tTrain Loss: {train_loss:.4f}")
+        print("\tVal " + ", ".join([f"{k}: {float(v):.4f}" for k,v in val_metrics.items()]))
 
-        # scheduler sul validation TOTAL
-        scheduler.step(val_losses['TOTAL'])
-
-        print(f"\tTrain Loss(backprop): {train_loss:.4f}")
-        print("\tTrain " + ", ".join([f"{k}: {float(v):.4f}" for k,v in train_losses.items()]))
-        print("\tVal   " + ", ".join([f"{k}: {float(v):.4f}" for k,v in val_losses.items()]))
-
-        # ---- TensorBoard scalari ----
         train_writer.add_scalar("Loss", train_loss, epoch)
-        for k, v in train_losses.items():
-            tag = "Loss" if k.lower() == "total" else k
-            train_writer.add_scalar(tag, float(v), epoch)
-        for k, v in val_losses.items():
+        for k, v in val_metrics.items():
             tag = "Loss" if k.lower() == "total" else k
             val_writer.add_scalar(tag, float(v), epoch)
 
-        # ---- TensorBoard + PNG per confusion matrices (una per soglia) ----
-        cm_dir = os.path.join(log_dir, "confusion_matrices")
-        os.makedirs(cm_dir, exist_ok=True)
-
-        for thr in THRESHOLDS_DBZ:
-            # Train
-            t = train_thr[thr]
-            _plot_confusion_matrix(
-                t["TN"], t["FP"], t["FN"], t["TP"],
-                title=f"Train_CM_{thr}dBZ",
-                out_png=os.path.join(cm_dir, f"epoch_{epoch:03d}_train_{thr}dBZ.png"),
-                writer=train_writer, global_step=epoch
-            )
-            # Val
-            v = val_thr[thr]
-            _plot_confusion_matrix(
-                v["TN"], v["FP"], v["FN"], v["TP"],
-                title=f"Val_CM_{thr}dBZ",
-                out_png=os.path.join(cm_dir, f"epoch_{epoch:03d}_val_{thr}dBZ.png"),
-                writer=val_writer, global_step=epoch
-            )
-            # Logga metriche derivate come scalari
-            for name, value in [("Precision", t["Precision"]), ("Recall", t["Recall"]),
-                                ("F1", t["F1"]), ("CSI", t["CSI"]), ("FAR", t["FAR"]),
-                                ("HSS", t["HSS"]), ("ETS", t["ETS"])]:
-                train_writer.add_scalar(f"{thr}dBZ/{name}", float(value), epoch)
-            for name, value in [("Precision", v["Precision"]), ("Recall", v["Recall"]),
-                                ("F1", v["F1"]), ("CSI", v["CSI"]), ("FAR", v["FAR"]),
-                                ("HSS", v["HSS"]), ("ETS", v["ETS"])]:
-                val_writer.add_scalar(f"{thr}dBZ/{name}", float(value), epoch)
-
-        # ---- CSV append per documentazione (train & val) ----
-        with open(csv_path, "a", newline="") as f:
-            w = csv.writer(f)
-            def _row(split, losses, thr_dict):
-                row = [epoch, split, losses["TOTAL"], losses["SmoothL1"], losses["MAE"], losses["FL"], losses["SSIM"]]
-                for thr in THRESHOLDS_DBZ:
-                    d = thr_dict[thr]
-                    row += [d["TP"], d["FP"], d["TN"], d["FN"],
-                            d["Precision"], d["Recall"], d["F1"],
-                            d["CSI"], d["FAR"], d["HSS"], d["ETS"]]
-                return row
-            w.writerow(_row("train", train_losses, train_thr))
-            w.writerow(_row("val",   val_losses,   val_thr))
-
-        # === anteprime e checkpoint come già facevi ===
+        # salva tutte le predizioni/target della VAL con nomi reali
         save_all_val_predictions(model, val_loader, DEVICE, VAL_PREVIEW_ROOT, epoch, overwrite=False)
         save_all_val_targets(val_loader, VAL_PREVIEW_ROOT, epoch, overwrite=False)
 
-        if val_losses['TOTAL'] < best_val:
-            best_val = val_losses['TOTAL']
+        # checkpoint sul best validation
+        if val_metrics['TOTAL'] < best_val:
+            best_val = val_metrics['TOTAL']
+            # Genera il report di valutazione
+            generate_evaluation_report(val_metrics, conf_matrix, os.path.join(CHECKPOINT_DIR, "evaluation_reports"))
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
+                'metrics': val_metrics,
+                'confusion_matrix': conf_matrix
             }, os.path.join(CHECKPOINT_DIR, "best_model.pth"))
 
     train_writer.close()
     val_writer.close()
     print("Training concluso.")
-    print(f"Report CSV: {csv_path}")
