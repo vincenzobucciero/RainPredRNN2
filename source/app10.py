@@ -3,15 +3,16 @@ import math
 import glob
 import datetime
 import time
+import csv
 import numpy as np
 from functools import partial
 from PIL import Image
-from contextlib import contextmanager
+
+import matplotlib
+matplotlib.use("Agg")  # backend non interattivo per salvare PNG
+import matplotlib.pyplot as plt
 
 import torch
-import torch._dynamo  # <— sopprime errori di Dynamo quando non usiamo compile
-torch._dynamo.config.suppress_errors = True
-
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
@@ -32,47 +33,32 @@ from einops import rearrange
 from einops.layers.torch import Rearrange
 from torch.utils.tensorboard.writer import SummaryWriter
 
-# =========================================
-# Config "pro-GPU"
-# =========================================
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-INIT_BATCH_SIZE = 64
-MAX_NUM_WORKERS = 32
+# ===============================
+# Config
+# ===============================
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+NUM_WORKERS = 8
+BATCH_SIZE = 4
 LEARNING_RATE = 1e-3
 NUM_EPOCHS = 1
 PRED_LENGTH = 6
-PIN_MEMORY = True
-USE_AMP = True
-USE_BF16 = True  # H100 consigliato
-TORCH_COMPILE = False  # <— disattivato per evitare errori di build gcc/C99
-BENCH_WARMUP = 10
-BENCH_MEASURE = 50
+pin_memory = True
+USE_AMP = True  # mixed precision su GPU moderne
 
-# Ottimizzazioni globali
-torch.backends.cudnn.benchmark = True
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-try:
-    torch.set_float32_matmul_precision('high')
-except Exception:
-    pass
+# Soglie dBZ per confusion/metriche (puoi cambiare qui)
+THRESHOLDS_DBZ = (5, 15, 30, 40)
 
-# =========================================
+# ===============================
 # Utils / Seed
-# =========================================
+# ===============================
 def set_seed(seed=15):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
 set_seed()
-
-def _hms(sec: float):
-    sec = int(max(0, sec))
-    h = sec // 3600
-    m = (sec % 3600) // 60
-    s = sec % 60
-    return f"{h:02d}:{m:02d}:{s:02d}"
 
 def normalize_image(img):
     img = np.nan_to_num(img, nan=0.0, posinf=0.0, neginf=0.0)
@@ -88,6 +74,7 @@ def get_augmentation_transforms():
     ])
 
 def tiff_is_readable_quick(path):
+    """Check veloce: prova a leggere UNA riga dalla banda 1."""
     try:
         with rasterio.open(path) as src:
             _ = src.read(1, window=((0, 1), (0, src.width)))
@@ -95,31 +82,10 @@ def tiff_is_readable_quick(path):
     except Exception:
         return False
 
-@contextmanager
-def autocast_ctx():
-    if DEVICE == "cuda" and USE_AMP:
-        if USE_BF16 and torch.cuda.is_bf16_supported():
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                yield
-        else:
-            with torch.autocast(device_type="cuda", dtype=torch.float16):
-                yield
-    else:
-        yield
 
-def to_dev_cl4(t: torch.Tensor, device: str):
-    """
-    Sposta su device e applica channels_last SOLO se il tensore è 4D (N, C, H, W).
-    Evita l'errore 'required rank 4 tensor to use channels_last format'.
-    """
-    t = t.to(device, non_blocking=True)
-    if t.dim() == 4:
-        t = t.contiguous(memory_format=torch.channels_last)
-    return t
-
-# =========================================
+# ===============================
 # Dataset
-# =========================================
+# ===============================
 class RadarDataset(Dataset):
     def __init__(self, data_path, input_length=18, pred_length=6, is_train=True,
                  generate_mask=True, return_paths=False, min_size=1024):
@@ -128,6 +94,7 @@ class RadarDataset(Dataset):
         self.seq_length = input_length + pred_length
         self.min_size = min_size
 
+        # .tif + .tiff
         self.files = []
         self.files += glob.glob(os.path.join(data_path, '**/*.tif'), recursive=True)
         self.files += glob.glob(os.path.join(data_path, '**/*.tiff'), recursive=True)
@@ -141,7 +108,7 @@ class RadarDataset(Dataset):
         self.is_train = is_train
         self.transform = transforms.Compose([
             transforms.Resize((224, 224)),
-            transforms.ToTensor(),                       # (C,H,W) in [0,1]
+            transforms.ToTensor(),
             transforms.Normalize(mean=[0.5], std=[0.5]),
         ])
         self.file_validity = {}
@@ -149,6 +116,7 @@ class RadarDataset(Dataset):
         self.total_possible_windows = max(0, len(self.files) - self.seq_length + 1)
         self.augmentation_transforms = get_augmentation_transforms() if is_train else None
 
+        # prescreen finestre valide - read-based (leggi solo una riga)
         for start_idx in range(self.total_possible_windows):
             ok = True
             for i in range(self.seq_length):
@@ -163,6 +131,7 @@ class RadarDataset(Dataset):
                     else:
                         valid = tiff_is_readable_quick(f)
                         if not valid:
+                            # log minimale per capire quali file saltano
                             print(f"File non valido (read fail): {f}")
                     self.file_validity[f] = valid
                 if not self.file_validity[f]:
@@ -191,6 +160,7 @@ class RadarDataset(Dataset):
         return len(self.valid_indices)
 
     def __getitem__(self, idx):
+        # retry/skip guardrail per file corrotti incontrati a runtime
         max_resamples = 8
         attempts = 0
         base_idx = idx
@@ -207,8 +177,10 @@ class RadarDataset(Dataset):
                     with rasterio.open(f) as src:
                         img = src.read(1).astype(np.float32)
                 except Exception:
+                    # marchia non valido e resample indice
                     self.file_validity[f] = False
                     failed = True
+                    # resample rapido: randomizza in train, sequenziale in val
                     if self.is_train:
                         idx = (idx + np.random.randint(1, 64)) % len(self.valid_indices)
                     else:
@@ -217,6 +189,7 @@ class RadarDataset(Dataset):
                     break
 
                 img = normalize_image(img)
+                # pipeline PIL + torchvision (semplice e sicura)
                 img = Image.fromarray((img * 255.0).astype(np.uint8))
                 img = self.transform(img)
                 images.append(img)
@@ -226,8 +199,9 @@ class RadarDataset(Dataset):
             if failed:
                 continue
 
-            all_frames = torch.stack(images)            # (seq, C, H, W)
-            all_frames = all_frames.permute(1, 0, 2, 3) # (C, seq, H, W)
+            # stack e augmentations
+            all_frames = torch.stack(images)                  # (seq, C, H, W)
+            all_frames = all_frames.permute(1, 0, 2, 3)       # (C, seq, H, W)
 
             if self.is_train and self.augmentation_transforms is not None:
                 all_frames = self.augmentation_transforms(all_frames)
@@ -238,15 +212,15 @@ class RadarDataset(Dataset):
             inputs  = all_frames[:, :self.input_length]       # (C, Tin, H, W)
             targets = all_frames[:, self.input_length:]       # (C, Tout, H, W)
 
-            # 4D → ok usare channels_last (N=Tin/Tout)
-            inputs  = inputs.permute(1, 0, 2, 3).contiguous(memory_format=torch.channels_last)   # (Tin, C, H, W)
-            targets = targets.permute(1, 0, 2, 3).contiguous(memory_format=torch.channels_last)  # (Tout, C, H, W)
+            inputs  = inputs.permute(1, 0, 2, 3)              # (Tin, C, H, W)
+            targets = targets.permute(1, 0, 2, 3)             # (Tout, C, H, W)
 
             mask = None
             if self.generate_mask:
-                mask = torch.where(targets > -1.0, 1.0, 0.0).contiguous(memory_format=torch.channels_last)
+                mask = torch.where(targets > -1.0, 1.0, 0.0)
 
             if self.return_paths:
+                # Guardrail: i path dei target DEVONO avere la stessa lunghezza di pred_length
                 if len(target_frame_paths) != self.pred_length:
                     raise RuntimeError(
                         f"target_frame_paths len={len(target_frame_paths)} diversa da pred_length={self.pred_length} "
@@ -255,11 +229,13 @@ class RadarDataset(Dataset):
                 return inputs, targets, mask, target_frame_paths
             return inputs, targets, mask
 
+        # se proprio non riusciamo dopo N tentativi
         raise RasterioIOError(f"Nessuna finestra valida dopo {max_resamples} tentativi; indice iniziale {base_idx}.")
 
-# =========================================
-# Modello (encoder/decoder + transformer)
-# =========================================
+
+# ===============================
+# Modello (encoder/decoder + “transformer” temporale)
+# ===============================
 class UNet_Encoder(nn.Module):
     def __init__(self, input_channels):
         super().__init__()
@@ -326,24 +302,28 @@ class TemporalTransformerBlock(nn.Module):
         ph = H // self.patch_height
         pw = W // self.patch_width
 
+        # 1) embedding a token per patch-tempo
         x = self.to_patch_embedding(x)  # (B, Tin*ph*pw, d)
         B, T, D = x.shape
 
+        # 2) positional encoding + encoder
         pe = generate_positional_encoding(T, D, x.device)
         mem = self.encoder(x + pe)  # (B, Tin*ph*pw, d)
 
+        # 3) prendi SOLO gli ultimi pred_length*ph*pw token
         tokens_per_frame = ph * pw
         needed = self.pred_length * tokens_per_frame
         assert needed <= T, f"pred_length ({self.pred_length}) * ph*pw ({tokens_per_frame}) > Tin*ph*pw ({T})"
         mem = mem[:, -needed:, :]  # (B, pred_length*ph*pw, d)
 
+        # 4) proietta e rimappa a feature map
         out = self.to_feature_map(mem)  # (B, pred_length*ph*pw, p1*p2*C)
         out = rearrange(
             out,
             'b (t h w) (p1 p2 c) -> b t c (h p1) (w p2)',
             t=self.pred_length, h=ph, w=pw,
             p1=self.patch_height, p2=self.patch_width
-        )
+        )  # (B, Tout, C, H, W)
         return out
 
 class RainPredRNN(nn.Module):
@@ -368,20 +348,27 @@ class RainPredRNN(nn.Module):
         pred_feats = self.transformer_block(enc_feats)   # (B, Tout, Cenc, H/2, W/2)
 
         preds, preds_noact = [], []
+        # ATT: valido finché pred_length <= Tin
         for t in range(pred_length):
             y, y_no = self.decoder(pred_feats[:, t], enc_feats[:, t], skip1[:, t])
             preds.append(y); preds_noact.append(y_no)
         return torch.stack(preds, dim=1), torch.stack(preds_noact, dim=1)
 
-# =========================================
-# Collate Fn (VALIDAZIONE) — niente channels_last qui (5D)
-# =========================================
+
+# ===============================
+# Collate Fn (VALIDAZIONE)
+# ===============================
 def collate_val(batch):
+    """
+    batch_size=1 → batch è una lista con un solo elemento, cioè la tupla
+    (inputs, targets, mask, paths). Ripristiniamo la batch dimension.
+    """
     item = batch[0]
     if len(item) != 4:
         raise RuntimeError("Validation loader deve restituire (inputs, targets, mask, paths).")
-    inputs, targets, mask, paths = item  # (Tin, C, H, W)
+    inputs, targets, mask, paths = item  # tensors 4D: (Tin, C, H, W)
 
+    # --- normalizza paths a lista piatta di stringhe
     if isinstance(paths, (list, tuple)) and paths and isinstance(paths[0], (list, tuple)):
         paths = list(paths[0])
     elif isinstance(paths, (list, tuple)):
@@ -389,103 +376,80 @@ def collate_val(batch):
     else:
         paths = [paths]
 
-    if inputs.dim() == 4:  inputs  = inputs.unsqueeze(0)  # -> (1, Tin, C, H, W)
-    if targets.dim() == 4: targets = targets.unsqueeze(0)
-    if mask is not None and mask.dim() == 4: mask = mask.unsqueeze(0)
+    # --- aggiungi batch dimension per tutti i tensori
+    if inputs.dim() == 4:
+        inputs = inputs.unsqueeze(0)   # (1, Tin, C, H, W)
+    if targets.dim() == 4:
+        targets = targets.unsqueeze(0) # (1, Tout, C, H, W)
+    if mask is not None and mask.dim() == 4:
+        mask = mask.unsqueeze(0)       # (1, Tout, C, H, W)
 
     return inputs, targets, mask, paths
 
-# =========================================
-# Dataloaders + autotuning batch size (definito ma NON usato nel main)
-# =========================================
-def _pin_kwargs():
-    kwargs = {}
-    try:
-        kwargs["pin_memory_device"] = "cuda"
-    except TypeError:
-        pass
-    return kwargs
 
-def create_dataloaders(data_path, batch_size=64, num_workers=32):
+
+# ===============================
+# DataLoaders (solo train/val)
+# ===============================
+def create_dataloaders(data_path, batch_size=4, num_workers=4):
     train_dataset = RadarDataset(os.path.join(data_path, 'train'), is_train=True, pred_length=PRED_LENGTH)
     val_dataset   = RadarDataset(os.path.join(data_path, 'val'),   is_train=False, return_paths=True, pred_length=PRED_LENGTH)
 
-    loader_kwargs = dict(
-        num_workers=num_workers,
-        pin_memory=PIN_MEMORY,
-        persistent_workers=True,
-        prefetch_factor=8,
-        drop_last=True,
-        **_pin_kwargs()
-    )
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        **loader_kwargs
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=True,
+        persistent_workers=True,
+        prefetch_factor=4
     )
     val_loader   = DataLoader(
         val_dataset,
         batch_size=1,
         shuffle=False,
-        collate_fn=collate_val,
-        **{**loader_kwargs, "drop_last": False}
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=True,
+        prefetch_factor=4,
+        collate_fn=collate_val,   # <--- FIX
     )
     return train_loader, val_loader
 
-def autotune_batch_size(model, data_path, init_bs=64, num_workers=32):
-    bs = max(1, int(init_bs))
-    while bs >= 1:
-        try:
-            train_loader, val_loader = create_dataloaders(data_path, bs, num_workers)
-            model.train()
-            optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-            scaler = torch.cuda.amp.GradScaler(enabled=(USE_AMP and DEVICE == "cuda" and not USE_BF16))
-            batch = next(iter(train_loader))
-            inputs, targets, mask = batch[:3]
-            inputs  = to_dev_cl4(inputs,  DEVICE)
-            targets = to_dev_cl4(targets, DEVICE)
-            mask    = to_dev_cl4(mask,    DEVICE)
-            optimizer.zero_grad(set_to_none=True)
-            with autocast_ctx():
-                outputs, logits = model(inputs, PRED_LENGTH)
-                loss = F.smooth_l1_loss(outputs, targets)*10 + vops.sigmoid_focal_loss(logits, mask, reduction='mean')*10
-            if torch.cuda.is_available(): torch.cuda.synchronize()
-            if USE_AMP and not USE_BF16:
-                scaler.scale(loss).backward(); scaler.step(optimizer); scaler.update()
-            else:
-                loss.backward(); optimizer.step()
-            del optimizer, scaler, batch, inputs, targets, mask, outputs, logits, loss
-            if torch.cuda.is_available(): torch.cuda.empty_cache()
-            print(f"[AutoBS] Batch size OK: {bs}")
-            return bs, train_loader, val_loader
-        except torch.cuda.OutOfMemoryError:
-            torch.cuda.empty_cache()
-            bs = bs // 2
-            print(f"[AutoBS] OOM: riduco batch size a {bs}")
-    raise RuntimeError("Autotuning batch size fallito anche con bs=1.")
 
-# =========================================
-# Benchmark
-# =========================================
-def benchmark_train(loader, model, optimizer, device, scaler=None, warmup=10, measure=50):
+# ===== Benchmark =====
+def _hms(sec: float):
+    sec = int(sec)
+    h = sec // 3600
+    m = (sec % 3600) // 60
+    s = sec % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+def benchmark_train(loader, model, optimizer, device, scaler=None, warmup=2, measure=10):
+    """Misura batch/s includendo forward+loss+backward+step (train)."""
     model.train()
     it = iter(loader)
-
+    # warmup
     for _ in range(warmup):
         batch = next(it)
         inputs, targets, mask = batch[:3]
-        inputs  = to_dev_cl4(inputs,  device)
-        targets = to_dev_cl4(targets, device)
-        mask    = to_dev_cl4(mask,    device)
+        inputs = inputs.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+        mask = mask.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
-        with autocast_ctx():
+        if scaler is not None:
+            with torch.cuda.amp.autocast():
+                outputs, logits = model(inputs, PRED_LENGTH)
+                loss = criterion_sl1(outputs, targets) * criterion_mae_lambda + criterion_fl(logits, mask) * criterion_mae_lambda
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
             outputs, logits = model(inputs, PRED_LENGTH)
             loss = criterion_sl1(outputs, targets) * criterion_mae_lambda + criterion_fl(logits, mask) * criterion_mae_lambda
-        if scaler is not None:
-            scaler.scale(loss).backward(); scaler.step(optimizer); scaler.update()
-        else:
-            loss.backward(); optimizer.step()
+            loss.backward()
+            optimizer.step()
 
     if torch.cuda.is_available(): torch.cuda.synchronize()
     t0 = time.perf_counter()
@@ -496,31 +460,36 @@ def benchmark_train(loader, model, optimizer, device, scaler=None, warmup=10, me
         except StopIteration:
             break
         inputs, targets, mask = batch[:3]
-        inputs  = to_dev_cl4(inputs,  device)
-        targets = to_dev_cl4(targets, device)
-        mask    = to_dev_cl4(mask,    device)
+        inputs = inputs.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+        mask = mask.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
-        with autocast_ctx():
+        if scaler is not None:
+            with torch.cuda.amp.autocast():
+                outputs, logits = model(inputs, PRED_LENGTH)
+                loss = criterion_sl1(outputs, targets) * criterion_mae_lambda + criterion_fl(logits, mask) * criterion_mae_lambda
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
             outputs, logits = model(inputs, PRED_LENGTH)
             loss = criterion_sl1(outputs, targets) * criterion_mae_lambda + criterion_fl(logits, mask) * criterion_mae_lambda
-        if scaler is not None:
-            scaler.scale(loss).backward(); scaler.step(optimizer); scaler.update()
-        else:
-            loss.backward(); optimizer.step()
+            loss.backward()
+            optimizer.step()
         counted += 1
     if torch.cuda.is_available(): torch.cuda.synchronize()
     dt = time.perf_counter() - t0
     return counted / dt if dt > 0 else 0.0
 
-def benchmark_val(loader, model, device, warmup=10, measure=50):
+def benchmark_val(loader, model, device, warmup=2, measure=20):
+    """Misura batch/s della sola forward (validation)."""
     model.eval()
     it = iter(loader)
     with torch.no_grad():
         for _ in range(warmup):
             batch = next(it)
-            inputs = to_dev_cl4(batch[0], device)
-            with autocast_ctx():
-                _ = model(inputs, PRED_LENGTH)
+            inputs = batch[0].to(device, non_blocking=True)
+            _ = model(inputs, PRED_LENGTH)
         if torch.cuda.is_available(): torch.cuda.synchronize()
         t0 = time.perf_counter()
         counted = 0
@@ -529,17 +498,18 @@ def benchmark_val(loader, model, device, warmup=10, measure=50):
                 batch = next(it)
             except StopIteration:
                 break
-            inputs = to_dev_cl4(batch[0], device)
-            with autocast_ctx():
-                _ = model(inputs, PRED_LENGTH)
+            inputs = batch[0].to(device, non_blocking=True)
+            _ = model(inputs, PRED_LENGTH)
             counted += 1
         if torch.cuda.is_available(): torch.cuda.synchronize()
     dt = time.perf_counter() - t0
     return counted / dt if dt > 0 else 0.0
+# ===== Fine benchmark =====
 
-# =========================================
-# Metriche & Train/Eval
-# =========================================
+
+# ===============================
+# Metriche & Train/Eval (base)
+# ===============================
 criterion_sl1 = nn.SmoothL1Loss()
 criterion_mae = nn.L1Loss()
 criterion_ssim = SSIM(data_range=1.0, size_average=True, channel=1, win_size=5)
@@ -554,6 +524,7 @@ def calculate_metrics(preds, targets, logits=None, mask=None, threshold_dbz=15):
     fl = 0
     if (logits is not None) and (mask is not None):
         fl = criterion_fl(logits, mask)
+
     total = sl1 + fl
 
     p = preds.numpy().squeeze()
@@ -584,64 +555,160 @@ def calculate_metrics(preds, targets, logits=None, mask=None, threshold_dbz=15):
 
     return {'TOTAL': total, 'SmoothL1': sl1, 'MAE': mae, 'FL': fl, 'SSIM': ssim_val, 'CSI': csi}
 
-def train_epoch(model, loader, optimizer, device, scaler=None, log_window=200):
+def train_epoch(model, loader, optimizer, device, scaler=None):
     model.train()
     total_loss = 0.0
-    t_last = time.time()
-    for step, (inputs, targets, mask) in enumerate(loader, start=1):
-        inputs  = to_dev_cl4(inputs,  device)
-        targets = to_dev_cl4(targets, device)
-        mask    = to_dev_cl4(mask,    device)
-
+    for inputs, targets, mask in loader:
+        inputs = inputs.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+        mask = mask.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
-        with autocast_ctx():
-            outputs, logits = model(inputs, PRED_LENGTH)
-            loss = criterion_sl1(outputs, targets) * criterion_mae_lambda
-            loss += criterion_fl(logits, mask) * criterion_mae_lambda
 
-        if scaler is not None and USE_AMP and not USE_BF16:
+        if scaler is not None:
+            with torch.cuda.amp.autocast():
+                outputs, logits = model(inputs, PRED_LENGTH)
+                loss = criterion_sl1(outputs, targets) * criterion_mae_lambda
+                loss += criterion_fl(logits, mask) * criterion_mae_lambda
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
         else:
+            outputs, logits = model(inputs, PRED_LENGTH)
+            loss = criterion_sl1(outputs, targets) * criterion_mae_lambda
+            loss += criterion_fl(logits, mask) * criterion_mae_lambda
             loss.backward()
             optimizer.step()
 
         total_loss += float(loss.detach().cpu())
-
-        if step % log_window == 0:
-            now = time.time()
-            bps = log_window / (now - t_last + 1e-9)
-            eta = (len(loader) - step) / max(bps, 1e-6)
-            print(f"[Train] step {step}/{len(loader)} | {bps:.2f} batch/s | ETA {eta/3600:.2f} h")
-            t_last = now
-
+    
     return total_loss / max(1, len(loader))
 
-def evaluate(model, loader, device):
+
+# ===============================
+# Estensioni: confusion matrix & metriche derivate
+# ===============================
+def _binarize_from_scaled(x01, thr_dbz):
+    """x01 è [0,1]; mappa a dBZ e binarizza."""
+    dbz = np.clip(x01 * 70.0, 0.0, 70.0)
+    return (dbz > thr_dbz).astype(np.uint8)
+
+def _confusion_counts(y_true_bin, y_pred_bin):
+    """Restituisce tn, fp, fn, tp come interi."""
+    cm = confusion_matrix(y_true_bin.flatten(), y_pred_bin.flatten(), labels=[0,1])
+    if cm.shape == (2,2):
+        tn, fp, fn, tp = cm.ravel()
+    else:
+        tn, fp, fn, tp = 0, 0, 0, 0
+    return int(tn), int(fp), int(fn), int(tp)
+
+def _metrics_from_cm(tn, fp, fn, tp):
+    """Calcola un set completo di metriche a partire da TN/FP/FN/TP."""
+    eps = 1e-10
+    precision = tp / (tp + fp + eps)
+    recall    = tp / (tp + fn + eps)  # POD / sensitivity
+    f1        = 2 * precision * recall / (precision + recall + eps)
+    csi       = tp / (tp + fp + fn + eps)
+    far       = fp / (tp + fp + eps)
+    # Heidke Skill Score (HSS) e Equitable Threat Score (ETS)
+    n   = tn + fp + fn + tp + eps
+    pc  = ((tp + tn) / n)
+    pe  = (((tp + fn) * (tp + fp)) + ((fp + tn) * (fn + tn))) / (n * n)
+    hss = (pc - pe) / (1 - pe + eps)
+    # ETS
+    random = ((tp + fp) * (tp + fn)) / n
+    ets = (tp - random) / (tp + fp + fn - random + eps)
+    return {
+        "TP": tp, "FP": fp, "TN": tn, "FN": fn,
+        "Precision": precision, "Recall": recall, "F1": f1,
+        "CSI": csi, "FAR": far, "HSS": hss, "ETS": ets
+    }
+
+def _plot_confusion_matrix(tn, fp, fn, tp, title, out_png=None, writer=None, global_step=None):
+    """Disegna e salva/manda a TensorBoard la matrice di confusione 2x2."""
+    mat = np.array([[tn, fp],
+                    [fn, tp]], dtype=np.int64)
+    fig, ax = plt.subplots(figsize=(3.4, 3.4))
+    ax.imshow(mat, interpolation="nearest")
+    ax.set_title(title)
+    ax.set_xticks([0,1]); ax.set_yticks([0,1])
+    ax.set_xticklabels(["Pred 0","Pred 1"]); ax.set_yticklabels(["True 0","True 1"])
+    for i in range(2):
+        for j in range(2):
+            ax.text(j, i, f"{mat[i, j]:,}", ha="center", va="center")
+    ax.set_xlabel("Predicted"); ax.set_ylabel("True")
+    fig.tight_layout()
+    if out_png:
+        fig.savefig(out_png, dpi=150)
+    if writer is not None:
+        writer.add_figure(title, fig, global_step=global_step, close=True)
+    plt.close(fig)
+
+def evaluate_with_confusion(model, loader, device, thresholds_dbz=(15,), max_batches=None):
+    """
+    Forward su 'loader' e aggrega confusion matrix e metriche per ciascuna soglia.
+    Ritorna: dict 'losses' + dict 'per_threshold' (ognuna con TN/FP/FN/TP e metriche).
+    """
     model.eval()
-    agg = {'MAE':0.0,'SSIM':0.0,'CSI':0.0,'SmoothL1':0.0,'FL':0.0,'TOTAL':0.0}
+    agg_losses = {'MAE':0.0,'SSIM':0.0,'CSI':0.0,'SmoothL1':0.0,'FL':0.0,'TOTAL':0.0}
+    # per soglia → contatori cumulativi
+    counters = {thr: {'tn':0,'fp':0,'fn':0,'tp':0} for thr in thresholds_dbz}
+
+    seen = 0
     with torch.no_grad():
-        for batch in loader:
+        for ib, batch in enumerate(loader):
+            if (max_batches is not None) and (ib >= max_batches):
+                break
             if len(batch) == 4:
                 inputs, targets, mask, _ = batch
             else:
                 inputs, targets, mask = batch
-            inputs  = to_dev_cl4(inputs,  device)
-            targets = to_dev_cl4(targets, device)
-            mask    = to_dev_cl4(mask,    device)
-            with autocast_ctx():
-                outputs, logits = model(inputs, PRED_LENGTH)
-            m = calculate_metrics(outputs, targets, logits, mask)
-            for k in agg: agg[k] += float(m[k])
-    for k in agg: agg[k] /= float(max(1, len(loader)))
-    torch.cuda.empty_cache()
-    return agg
 
-# =========================================
-# Salvataggi preview dalla VAL
-# =========================================
-def save_all_val_predictions(model, val_loader, device, out_root, epoch, overwrite=False):
+            inputs  = inputs.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
+            mask    = mask.to(device, non_blocking=True)
+
+            outputs, logits = model(inputs, PRED_LENGTH)
+            m = calculate_metrics(outputs, targets, logits, mask)
+            for k in agg_losses: agg_losses[k] += float(m[k])
+
+            # ---- Confusion per soglie ----
+            # scala a [0,1]
+            p = outputs.detach().cpu().numpy()
+            t = targets.detach().cpu().numpy()
+            if p.ndim == 5:  # (B,T,1,H,W)
+                p = p[:, :, 0]
+                t = t[:, :, 0]
+            p01 = np.clip(p * 0.5 + 0.5, 0.0, 1.0)
+            t01 = np.clip(t * 0.5 + 0.5, 0.0, 1.0)
+            for thr in thresholds_dbz:
+                p_bin = _binarize_from_scaled(p01, thr)
+                t_bin = _binarize_from_scaled(t01, thr)
+                tn, fp, fn, tp = _confusion_counts(t_bin, p_bin)
+                counters[thr]['tn'] += tn
+                counters[thr]['fp'] += fp
+                counters[thr]['fn'] += fn
+                counters[thr]['tp'] += tp
+            seen += 1
+
+    denom = float(max(1, seen))
+    for k in agg_losses: agg_losses[k] /= denom
+
+    per_thr = {}
+    for thr, c in counters.items():
+        per_thr[thr] = _metrics_from_cm(c['tn'], c['fp'], c['fn'], c['tp'])
+
+    return agg_losses, per_thr
+
+
+# ===============================
+# Salvataggi preview dalla VAL (completi, no duplicati)
+# ===============================
+def save_all_val_predictions(model, val_loader, device, out_root, epoch,
+                             overwrite=False):
+    """
+    Esegue la forward su TUTTA la validation e salva una sola prediction
+    per ciascun TIFF target, usando SEMPRE il nome reale (da target_paths).
+    """
     model.eval()
     ep_dir = os.path.join(out_root, f"epoch_{epoch:03d}")
     out_pred = os.path.join(ep_dir, "predictions")
@@ -655,12 +722,13 @@ def save_all_val_predictions(model, val_loader, device, out_root, epoch, overwri
                 raise RuntimeError("Validation loader deve restituire (inputs, targets, mask, paths).")
 
             inputs, targets, mask, paths = batch
+
+            # paths è già lista piatta grazie al collate_val
             if not paths or len(paths) == 0:
                 raise RuntimeError("Mancano i target_paths nella validation: disabilitato il fallback frame_XX.")
 
-            inputs  = to_dev_cl4(inputs, device)
-            with autocast_ctx():
-                outputs, _ = model(inputs, PRED_LENGTH)  # (1, T, 1, H, W)
+            inputs  = inputs.to(device, non_blocking=True)
+            outputs, _ = model(inputs, PRED_LENGTH)  # (1, T, 1, H, W)
 
             preds = outputs.detach().cpu().numpy()
             preds = preds * 0.5 + 0.5
@@ -687,6 +755,7 @@ def save_all_val_predictions(model, val_loader, device, out_root, epoch, overwri
                 frame = (preds[t] * 255.0).clip(0, 255).astype(np.uint8)
                 Image.fromarray(frame).save(out_path)
 
+
 def save_all_val_targets(val_loader, out_root, epoch, overwrite=False):
     ep_dir = os.path.join(out_root, f"epoch_{epoch:03d}")
     out_targ = os.path.join(ep_dir, "targets")
@@ -698,6 +767,8 @@ def save_all_val_targets(val_loader, out_root, epoch, overwrite=False):
             raise RuntimeError("Validation loader deve restituire (inputs, targets, mask, paths).")
 
         _, targets, _, paths = batch
+
+        # paths è già lista piatta grazie al collate_val
         if not paths or len(paths) == 0:
             raise RuntimeError("Mancano i target_paths nella validation: disabilitato il fallback frame_XX.")
 
@@ -726,76 +797,147 @@ def save_all_val_targets(val_loader, out_root, epoch, overwrite=False):
             frame = (targs[t] * 255.0).clip(0, 255).astype(np.uint8)
             Image.fromarray(frame).save(out_path)
 
-# =========================================
+
+# ===============================
 # MAIN
-# =========================================
+# ===============================
 if __name__ == "__main__":
+    # Path degli split “clean” (train/val)
     DATA_PATH = os.path.abspath("/home/v.bucciero/data/instruments/rdr0_splits/")
 
+    # logging & writers
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     log_dir = os.path.join("runs", timestamp)
     os.makedirs(log_dir, exist_ok=True)
     train_writer = SummaryWriter(log_dir=os.path.join(log_dir, "Train"))
     val_writer   = SummaryWriter(log_dir=os.path.join(log_dir, "Validation"))
 
+    # model & opt
     model = RainPredRNN(input_dim=1, num_hidden=256, max_hidden_channels=128,
                         patch_height=16, patch_width=16).to(DEVICE)
-    # Predisposizione channels_last per layer conv
-    model = model.to(memory_format=torch.channels_last)
-    if TORCH_COMPILE and hasattr(torch, "compile"):
-        try:
-            model = torch.compile(model, mode="reduce-overhead", fullgraph=False)
-            print("[Compile] torch.compile attivato.")
-        except Exception as e:
-            print(f"[Compile] torch.compile disabilitato: {e}")
-
-    # === Forza batch size grande (puoi salire a 128/256 se la VRAM lo permette)
-    bs = 64
-    train_loader, val_loader = create_dataloaders(
-        DATA_PATH, batch_size=bs, num_workers=MAX_NUM_WORKERS
-    )
-    print(f"[Config] Batch size forzato: {bs} | Workers: {MAX_NUM_WORKERS}")
-
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5)
-    scaler = torch.cuda.amp.GradScaler(enabled=(USE_AMP and DEVICE == "cuda" and not USE_BF16))
+    scaler = torch.cuda.amp.GradScaler(enabled=(USE_AMP and DEVICE == "cuda"))
 
-    # Benchmark realistico
+    # data
+    train_loader, val_loader = create_dataloaders(DATA_PATH, BATCH_SIZE, NUM_WORKERS)
+
+    # Stima tempi
     steps_train = len(train_loader)
     steps_val = len(val_loader)
-    bps_train = benchmark_train(train_loader, model, optimizer, DEVICE, scaler=scaler,
-                                warmup=BENCH_WARMUP, measure=BENCH_MEASURE)
-    bps_val   = benchmark_val(val_loader,   model, DEVICE, warmup=BENCH_WARMUP, measure=BENCH_MEASURE)
+
+    bps_train = benchmark_train(train_loader, model, optimizer, DEVICE, scaler=scaler, warmup=2, measure=10)
+    bps_val   = benchmark_val(val_loader, model, DEVICE, warmup=2, measure=50)
+
+    def _hms_loc(sec: float):
+        sec = 0 if (sec is None or sec == float('inf')) else sec
+        return _hms(sec)
+
     eta_train = steps_train / bps_train if bps_train > 0 else float('inf')
     eta_val   = steps_val   / bps_val   if bps_val   > 0 else float('inf')
-    print(f"[Benchmark] Train: ~{bps_train:.2f} batch/s | steps/epoch={steps_train} | ETA epoca ≈ {_hms(eta_train)}")
-    print(f"[Benchmark] Val  : ~{bps_val:.2f} batch/s | steps/val  ={steps_val}   | ETA val   ≈ {_hms(eta_val)}")
 
+    print(f"[Benchmark] Train: ~{bps_train:.2f} batch/s | steps/epoch={steps_train} | ETA epoca ≈ {_hms_loc(eta_train)}")
+    print(f"[Benchmark] Val  : ~{bps_val:.2f} batch/s | steps/val  ={steps_val}   | ETA val   ≈ {_hms_loc(eta_val)}")
+
+    # dove salvo le anteprime dalla validation ad ogni epoca
     VAL_PREVIEW_ROOT = "/home/v.bucciero/data/instruments/rdr0_previews_h100gpu"
     os.makedirs(VAL_PREVIEW_ROOT, exist_ok=True)
 
     best_val = float('inf')
     CHECKPOINT_DIR = "checkpoints"; os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
+    # CSV per metriche per-epoca
+    csv_path = os.path.join(log_dir, "metrics_per_epoch.csv")
+    with open(csv_path, "w", newline="") as f:
+        w = csv.writer(f)
+        # header dinamico
+        header = ["epoch","split","TOTAL","SmoothL1","MAE","FL","SSIM"]
+        for thr in THRESHOLDS_DBZ:
+            header += [f"{thr}dBZ_TP", f"{thr}dBZ_FP", f"{thr}dBZ_TN", f"{thr}dBZ_FN",
+                       f"{thr}dBZ_Precision", f"{thr}dBZ_Recall", f"{thr}dBZ_F1",
+                       f"{thr}dBZ_CSI", f"{thr}dBZ_FAR", f"{thr}dBZ_HSS", f"{thr}dBZ_ETS"]
+        w.writerow(header)
+
     for epoch in range(NUM_EPOCHS):
         print(f"Epoch {epoch+1}/{NUM_EPOCHS}")
-        train_loss = train_epoch(model, train_loader, optimizer, DEVICE, scaler=scaler, log_window=200)
-        val_metrics = evaluate(model, val_loader, DEVICE)
-        scheduler.step(val_metrics['TOTAL'])
+        train_loss = train_epoch(model, train_loader, optimizer, DEVICE, scaler=scaler)
 
-        print(f"\tTrain Loss: {train_loss:.4f}")
-        print("\tVal " + ", ".join([f"{k}: {float(v):.4f}" for k,v in val_metrics.items()]))
+        # --- EVAL TRAIN (puoi mettere max_batches=N per velocizzare)
+        train_losses, train_thr = evaluate_with_confusion(
+            model, train_loader, DEVICE, thresholds_dbz=THRESHOLDS_DBZ, max_batches=None
+        )
+        # --- EVAL VAL
+        val_losses, val_thr = evaluate_with_confusion(
+            model, val_loader, DEVICE, thresholds_dbz=THRESHOLDS_DBZ, max_batches=None
+        )
 
+        # scheduler sul validation TOTAL
+        scheduler.step(val_losses['TOTAL'])
+
+        print(f"\tTrain Loss(backprop): {train_loss:.4f}")
+        print("\tTrain " + ", ".join([f"{k}: {float(v):.4f}" for k,v in train_losses.items()]))
+        print("\tVal   " + ", ".join([f"{k}: {float(v):.4f}" for k,v in val_losses.items()]))
+
+        # ---- TensorBoard scalari ----
         train_writer.add_scalar("Loss", train_loss, epoch)
-        for k, v in val_metrics.items():
+        for k, v in train_losses.items():
+            tag = "Loss" if k.lower() == "total" else k
+            train_writer.add_scalar(tag, float(v), epoch)
+        for k, v in val_losses.items():
             tag = "Loss" if k.lower() == "total" else k
             val_writer.add_scalar(tag, float(v), epoch)
 
+        # ---- TensorBoard + PNG per confusion matrices (una per soglia) ----
+        cm_dir = os.path.join(log_dir, "confusion_matrices")
+        os.makedirs(cm_dir, exist_ok=True)
+
+        for thr in THRESHOLDS_DBZ:
+            # Train
+            t = train_thr[thr]
+            _plot_confusion_matrix(
+                t["TN"], t["FP"], t["FN"], t["TP"],
+                title=f"Train_CM_{thr}dBZ",
+                out_png=os.path.join(cm_dir, f"epoch_{epoch:03d}_train_{thr}dBZ.png"),
+                writer=train_writer, global_step=epoch
+            )
+            # Val
+            v = val_thr[thr]
+            _plot_confusion_matrix(
+                v["TN"], v["FP"], v["FN"], v["TP"],
+                title=f"Val_CM_{thr}dBZ",
+                out_png=os.path.join(cm_dir, f"epoch_{epoch:03d}_val_{thr}dBZ.png"),
+                writer=val_writer, global_step=epoch
+            )
+            # Logga metriche derivate come scalari
+            for name, value in [("Precision", t["Precision"]), ("Recall", t["Recall"]),
+                                ("F1", t["F1"]), ("CSI", t["CSI"]), ("FAR", t["FAR"]),
+                                ("HSS", t["HSS"]), ("ETS", t["ETS"])]:
+                train_writer.add_scalar(f"{thr}dBZ/{name}", float(value), epoch)
+            for name, value in [("Precision", v["Precision"]), ("Recall", v["Recall"]),
+                                ("F1", v["F1"]), ("CSI", v["CSI"]), ("FAR", v["FAR"]),
+                                ("HSS", v["HSS"]), ("ETS", v["ETS"])]:
+                val_writer.add_scalar(f"{thr}dBZ/{name}", float(value), epoch)
+
+        # ---- CSV append per documentazione (train & val) ----
+        with open(csv_path, "a", newline="") as f:
+            w = csv.writer(f)
+            def _row(split, losses, thr_dict):
+                row = [epoch, split, losses["TOTAL"], losses["SmoothL1"], losses["MAE"], losses["FL"], losses["SSIM"]]
+                for thr in THRESHOLDS_DBZ:
+                    d = thr_dict[thr]
+                    row += [d["TP"], d["FP"], d["TN"], d["FN"],
+                            d["Precision"], d["Recall"], d["F1"],
+                            d["CSI"], d["FAR"], d["HSS"], d["ETS"]]
+                return row
+            w.writerow(_row("train", train_losses, train_thr))
+            w.writerow(_row("val",   val_losses,   val_thr))
+
+        # === anteprime e checkpoint come già facevi ===
         save_all_val_predictions(model, val_loader, DEVICE, VAL_PREVIEW_ROOT, epoch, overwrite=False)
         save_all_val_targets(val_loader, VAL_PREVIEW_ROOT, epoch, overwrite=False)
 
-        if val_metrics['TOTAL'] < best_val:
-            best_val = val_metrics['TOTAL']
+        if val_losses['TOTAL'] < best_val:
+            best_val = val_losses['TOTAL']
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
@@ -805,3 +947,4 @@ if __name__ == "__main__":
     train_writer.close()
     val_writer.close()
     print("Training concluso.")
+    print(f"Report CSV: {csv_path}")
