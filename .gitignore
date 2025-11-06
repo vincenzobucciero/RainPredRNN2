@@ -186,5 +186,8 @@ dataset_nord/
 instruments/
 predictions/
 targets/
+extracted_tiff/
+logs/
+pred_out/
 
 rdr0.tar.gz
