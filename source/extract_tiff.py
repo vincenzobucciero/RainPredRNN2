@@ -66,7 +66,7 @@ def save_state(state_path, start):
 
 def main():
     ap = argparse.ArgumentParser(description="Estrai una finestra contigua di TIFF.")
-    ap.add_argument("--src", default="/storage/external_01/hiwefi/data/rdr0_splits",
+    ap.add_argument("--src", default="/storage/external_01/hiwefi/data/rdr0_splits/test",
                     help="Root sorgente (ricorsivo).")
     ap.add_argument("--dst", default="/home/vbucciero/projects/RainPredRNN2/extracted_tiff",
                     help="Cartella destinazione.")
