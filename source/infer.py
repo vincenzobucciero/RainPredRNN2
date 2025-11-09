@@ -45,7 +45,7 @@ def load_18_stack(input_dir):
             img = src.read(1).astype(np.float32)  # banda 1
         img = normalize_image(img)                       # [0,1]
         img = Image.fromarray((img * 255.0).astype(np.uint8))
-        img = img.resize(RESIZE_HW, Image.BILINEAR)
+        img = img.resize(RESIZE_HW, Image.Resampling.BILINEAR)
         arr = np.asarray(img).astype(np.float32) / 255.0  # [0,1]
         arr = (arr - 0.5) / 0.5                           # Normalize(mean=0.5,std=0.5) -> [-1,1]
         arr = arr[None, ...]                               # (C=1, H, W)
